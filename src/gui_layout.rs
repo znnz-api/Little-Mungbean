@@ -371,9 +371,6 @@ pub const LOG_MENU_BUTTON_RADIUS: u8 = 8;
 pub const LOG_MENU_BUTTON_GAP: f32 = 4.0;
 pub const LOG_MENU_BUTTON_BG: [u8; 3] = [59, 59, 59];
 pub const LOG_MENU_BUTTON_FONT_SIZE: f32 = 11.0;
-// 日志内容右键菜单沿用日志悬停菜单的样式，但使用更窄的宽度。
-pub const LOG_COPY_MENU_WIDTH: f32 = 78.0;
-
 // 日志浮动窗口的固定高度。
 pub const LOG_WINDOW_HEIGHT: f32 = 317.0;
 // 日志浮动窗口与主窗口左侧、右侧和下侧之间的距离。

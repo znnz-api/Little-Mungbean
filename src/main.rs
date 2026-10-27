@@ -6,6 +6,13 @@ macro_rules! println {
     ($($arg:tt)*) => { crate::background::print_line(format_args!($($arg)*)) };
 }
 
+#[cfg(target_os = "macos")]
+const APP_VERSION: &str = env!("LITTLE_MUNGBEAN_MACOS_VERSION");
+#[cfg(windows)]
+const APP_VERSION: &str = env!("LITTLE_MUNGBEAN_WINDOWS_VERSION");
+#[cfg(not(any(windows, target_os = "macos")))]
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod account_mode;
 mod background;
 mod backup;
@@ -15,6 +22,10 @@ mod claude_desktop;
 mod claude_desktop_proxy;
 mod claude_desktop_registry;
 mod cli;
+#[cfg(not(target_os = "macos"))]
+mod client_installer;
+#[cfg(target_os = "macos")]
+#[path = "macos_installer.rs"]
 mod client_installer;
 mod config;
 mod desktop;
@@ -30,12 +41,22 @@ mod gui_worker;
 mod helper;
 mod i18n;
 mod injection;
+mod install_policy;
 mod local_gateway;
+#[cfg(target_os = "macos")]
+mod macos_tray;
+#[cfg(target_os = "macos")]
+mod macos_window;
+mod mcp;
+mod mcp_registry;
 mod network_proxy;
 mod platform;
+mod platform_paths;
 mod protocol;
 mod protocol_stream;
 mod runtime_state;
+mod skill_registry;
+mod skills;
 mod tool_signatures;
 #[cfg(windows)]
 mod tray;
@@ -59,10 +80,10 @@ fn main() {
     if gui_mode {
         crate::platform::install_gui_panic_hook();
         let _gui_mutex =
-            match crate::platform::try_acquire_named_mutex(r"Local\Agent-Switch-gui-v1") {
+            match crate::platform::try_acquire_named_mutex(r"Local\Little-Mungbean-gui-v1") {
                 Ok(Some(guard)) => guard,
                 Ok(None) => {
-                    let _ = crate::platform::activate_window_by_title(gui::WINDOW_TITLE);
+                    let _ = crate::platform::activate_window_by_title(gui::window_title());
                     return;
                 }
                 Err(error) => {
@@ -99,21 +120,26 @@ fn main() {
         }
     };
     if let Err(error) = runtime.block_on(run_cli()) {
-        report_cli_failure(i18n::tr("错误", "Error"), &format!("{error:#}"));
+        let detail = if std::env::var_os("LITTLE_MUNGBEAN_RUNTIME_LOG_PATH").is_some() {
+            i18n::runtime_log_error(&error)
+        } else {
+            format!("{error:#}")
+        };
+        report_cli_failure(i18n::tr("错误", "Error"), &detail);
         std::process::exit(1);
     }
 }
 
 fn report_cli_failure(title: &str, detail: &str) {
-    let detail = if std::env::var_os("ZNNZ_RUNTIME_LOG_PATH").is_some() {
-        i18n::runtime_error_text(detail)
+    let detail = if std::env::var_os("LITTLE_MUNGBEAN_RUNTIME_LOG_PATH").is_some() {
+        i18n::runtime_log_error_text(detail)
     } else {
         detail.to_owned()
     };
-    if std::env::var_os("ZNNZ_RUNTIME_LOG_PATH").is_some() {
+    if std::env::var_os("LITTLE_MUNGBEAN_RUNTIME_LOG_PATH").is_some() {
         eprintln!("\n{title}:");
         for line in detail.lines() {
-            eprintln!("  {}", line.trim_end());
+            eprintln!("    {}", line.trim());
         }
     } else {
         eprintln!("\n{title}: {detail}");
@@ -133,7 +159,7 @@ async fn run_cli() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "znnz_agent_launcher=info".into()),
+                .unwrap_or_else(|_| "little_mungbean=info".into()),
         )
         .with_target(false)
         .with_ansi(std::io::stderr().is_terminal())
@@ -311,6 +337,24 @@ async fn run_cli() -> Result<()> {
         Command::InternalGateway => {
             local_gateway::run_daemon().await?;
         }
+        Command::InternalDesktopLaunch {
+            executable,
+            target_args,
+            unset_environment,
+        } => {
+            #[cfg(target_os = "macos")]
+            {
+                let pid =
+                    platform::run_detached_desktop(&executable, &target_args, &unset_environment)?;
+                use std::io::Write;
+                writeln!(std::io::stdout(), "{pid}")?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (executable, target_args, unset_environment);
+                bail!("Detached Desktop launch is only available on macOS");
+            }
+        }
         Command::InternalClientStatus => {
             let processes = platform::running_client_processes()?;
             for target in gui_worker::ClientTarget::ALL {
@@ -354,7 +398,11 @@ fn acquire_key(cli_key: Option<String>, paths: &ClientPaths) -> Result<String> {
     if let Some(value) = cli_key.filter(|value| !value.trim().is_empty()) {
         return Ok(value);
     }
-    for name in ["ZNNZ_API_KEY", "LITEAPI_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
+    for name in [
+        "LITTLE_MUNGBEAN_API_KEY",
+        "LITEAPI_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+    ] {
         if let Ok(value) = std::env::var(name)
             && !value.trim().is_empty()
         {

@@ -1,5 +1,9 @@
 use crate::gui_worker::ClientTarget;
 use crate::i18n;
+use crate::install_policy::{
+    CONNECT_TIMEOUT, DOWNLOAD_IDLE_TIMEOUT, MIRROR_INSTALL_TIMEOUT as NPM_MIRROR_INSTALL_TIMEOUT,
+    OFFICIAL_INSTALL_TIMEOUT as NPM_OFFICIAL_INSTALL_TIMEOUT, SOURCE_PROBE_TIMEOUT,
+};
 use crate::network_proxy;
 use crate::platform;
 use anyhow::{Context, Result, bail};
@@ -26,10 +30,6 @@ const INSTALL_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 // 终端客户端安装：先快速判断官方源是否可用，避免国内网络在官方源上无限等待。
-const SOURCE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const NPM_OFFICIAL_INSTALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
-const NPM_MIRROR_INSTALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const NODE_MIRROR_INDEX_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_AUTO_LAUNCH_DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 const CODEX_AUTO_LAUNCH_CLOSE_GRACE: Duration = Duration::from_millis(1200);
@@ -44,7 +44,7 @@ const CLAUDE_DESKTOP_ARM64: &str = "https://claude.ai/api/desktop/win32/arm64/ms
 const CLAUDE_DESKTOP_FALLBACK: &str = "https://r.networkpe.top/znnz-claude-desktop";
 
 const SENSITIVE_ENVIRONMENT_KEYS: &[&str] = &[
-    "ZNNZ_API_KEY",
+    "LITTLE_MUNGBEAN_API_KEY",
     "LITEAPI_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "OPENAI_API_KEY",
@@ -158,7 +158,6 @@ async fn install_terminal_client(target: ClientTarget) -> Result<()> {
     println!("Node.js: {}", node.display());
     println!("npm:     {}", npm.display());
 
-    let client = http_client()?;
     let mut errors = Vec::new();
     for (label, registry, install_timeout, probe_first) in [
         (
@@ -171,24 +170,18 @@ async fn install_terminal_client(target: ClientTarget) -> Result<()> {
             i18n::tr("npmmirror 国内镜像", "npmmirror registry"),
             NPM_MIRROR_REGISTRY,
             NPM_MIRROR_INSTALL_TIMEOUT,
-            false,
+            true,
         ),
     ] {
         if probe_first {
             println!(
                 "{}",
-                i18n::tr(
-                    "正在检测 npm 官方源……",
-                    "Checking the official npm registry…"
-                )
+                i18n::tr("正在检测 npm 安装源……", "Checking the npm registry…")
             );
-            if let Err(error) = probe_npm_registry(&client, registry).await {
+            if let Err(error) = probe_npm_registry(registry).await {
                 println!(
                     "{}: {}",
-                    i18n::tr(
-                        "npm 官方源不可用，正在切换 npmmirror 国内镜像",
-                        "The official npm registry is unavailable; switching to npmmirror"
-                    ),
+                    i18n::tr("npm 安装源不可用", "The npm registry is unavailable"),
                     i18n::runtime_error(&error)
                 );
                 errors.push(format!("{label}: {error:#}"));
@@ -224,8 +217,14 @@ async fn install_terminal_client(target: ClientTarget) -> Result<()> {
     bail!("{} 安装失败：{}", target.title(), errors.join("；"))
 }
 
-async fn probe_npm_registry(client: &reqwest::Client, registry: &str) -> Result<()> {
+async fn probe_npm_registry(registry: &str) -> Result<()> {
     let ping_url = format!("{}/-/ping", registry.trim_end_matches('/'));
+    let client = network_proxy::Client::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(SOURCE_PROBE_TIMEOUT)
+    })?
+    .total_timeout(SOURCE_PROBE_TIMEOUT);
     let probe = async {
         client
             .get(&ping_url)
@@ -238,7 +237,7 @@ async fn probe_npm_registry(client: &reqwest::Client, registry: &str) -> Result<
     };
     tokio::time::timeout(SOURCE_PROBE_TIMEOUT, probe)
         .await
-        .with_context(|| format!("npm 官方源连接超过 {} 秒", SOURCE_PROBE_TIMEOUT.as_secs()))??;
+        .with_context(|| format!("npm 安装源连接超过 {} 秒", SOURCE_PROBE_TIMEOUT.as_secs()))??;
     Ok(())
 }
 
@@ -256,6 +255,7 @@ async fn run_npm_install(
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
     let mut command = sanitized_command(&cmd);
     command.args(["/D", "/C", "call"]).arg(npm).args(&arguments);
+    command.envs(crate::install_policy::npm_network_environment());
     for (name, value) in network_proxy::child_proxy_environment(registry)? {
         command.env(name, value);
     }
@@ -339,7 +339,13 @@ async fn stop_timed_out_process_tree(child: &mut Child) {
 }
 
 async fn install_node_lts() -> Result<()> {
-    let client = http_client()?;
+    let client = network_proxy::Client::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(DOWNLOAD_IDLE_TIMEOUT)
+            .timeout(DOWNLOAD_TIMEOUT)
+    })?
+    .total_timeout(DOWNLOAD_TIMEOUT);
     let architecture = windows_architecture()?;
     let mut errors = Vec::new();
 
@@ -355,7 +361,7 @@ async fn install_node_lts() -> Result<()> {
             i18n::tr("npmmirror Node 镜像", "npmmirror Node.js source"),
             NODE_MIRROR_INDEX,
             "https://npmmirror.com/mirrors/node",
-            NODE_MIRROR_INDEX_TIMEOUT,
+            SOURCE_PROBE_TIMEOUT,
             NPM_MIRROR_INSTALL_TIMEOUT,
         ),
     ] {
@@ -443,7 +449,7 @@ async fn run_msi_installer(path: &Path) -> Result<()> {
 }
 
 const CLAUDE_MSIX_VALIDATION_SCRIPT: &str = r#"
-$package = $env:ZNNZ_INSTALL_PACKAGE
+$package = $env:LITTLE_MUNGBEAN_INSTALL_PACKAGE
 if ([string]::IsNullOrWhiteSpace($package) -or -not (Test-Path -LiteralPath $package -PathType Leaf)) {
     throw 'Claude Desktop MSIX 文件不存在'
 }
@@ -499,7 +505,7 @@ async fn run_claude_powershell(path: &Path, script: &str, operation: &str) -> Re
             "-Command",
             script,
         ])
-        .env("ZNNZ_INSTALL_PACKAGE", path)
+        .env("LITTLE_MUNGBEAN_INSTALL_PACKAGE", path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = command
@@ -579,7 +585,7 @@ async fn run_msix_installer_elevated(path: &Path) -> Result<()> {
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'
 try {{
-    $env:ZNNZ_INSTALL_PACKAGE = {package}
+    $env:LITTLE_MUNGBEAN_INSTALL_PACKAGE = {package}
     {validation}
     Add-AppxPackage -Path $package -ForceApplicationShutdown
 }} catch {{
@@ -1011,7 +1017,7 @@ fn validate_claude_download(downloaded: &DownloadedFile) -> Result<()> {
 }
 
 async fn fetch_node_releases(
-    client: &reqwest::Client,
+    client: &network_proxy::Client,
     index_url: &str,
     limit: Duration,
 ) -> Result<Vec<NodeRelease>> {
@@ -1033,7 +1039,7 @@ async fn fetch_node_releases(
 }
 
 async fn download_to_with_timeout(
-    client: &reqwest::Client,
+    client: &network_proxy::Client,
     url: &str,
     destination: &Path,
     limit: Duration,
@@ -1049,18 +1055,19 @@ async fn download_to_with_timeout(
     }
 }
 
-fn http_client() -> Result<reqwest::Client> {
-    network_proxy::configure_reqwest_builder(reqwest::Client::builder())?
-        .user_agent(concat!("Agent-Switch/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(DOWNLOAD_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .context("无法初始化安装下载器")
+fn http_client() -> Result<network_proxy::Client> {
+    Ok(network_proxy::Client::new(|| {
+        reqwest::Client::builder()
+            .user_agent(concat!("Little-Mungbean/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(DOWNLOAD_TIMEOUT)
+    })
+    .context("无法初始化安装下载器")?
+    .total_timeout(DOWNLOAD_TIMEOUT))
 }
 
 async fn download_to(
-    client: &reqwest::Client,
+    client: &network_proxy::Client,
     url: &str,
     destination: &Path,
 ) -> Result<DownloadedFile> {
@@ -1157,7 +1164,7 @@ fn downloads_directory() -> Result<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| path.is_dir())
         .unwrap_or_else(std::env::temp_dir);
-    Ok(local.join("Agent-Switch").join("downloads"))
+    Ok(local.join("Little-Mungbean").join("downloads"))
 }
 
 fn windows_architecture() -> Result<&'static str> {
@@ -1247,7 +1254,7 @@ mod tests {
 
     #[test]
     fn terminal_install_timeouts_match_network_fallback_policy() {
-        assert_eq!(SOURCE_PROBE_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(SOURCE_PROBE_TIMEOUT, Duration::from_secs(15));
         assert_eq!(NPM_OFFICIAL_INSTALL_TIMEOUT, Duration::from_secs(120));
         assert_eq!(NPM_MIRROR_INSTALL_TIMEOUT, Duration::from_secs(300));
     }

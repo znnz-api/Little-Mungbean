@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 20 20">
+  <path d="M0 0h20v20H0z" fill="none" />
+  <g transform="translate(10 10) scale(-1.25) translate(-10 -10)" fill="#e6e6e6" stroke="#e6e6e6">
+    <!-- 圆点 -->
+    <circle cx="3.75" cy="5" r="1.1" stroke="none"/>
+    <circle cx="3.75" cy="10" r="1.1" stroke="none"/>
+    <circle cx="3.75" cy="15" r="1.1" stroke="none"/>
+    <!-- 横线：stroke-width 直接控制粗细 -->
+    <path d="M8.333 5H16.667M8.333 10H16.667M8.333 15H16.667" fill="none" stroke-width="1.6" stroke-linecap="round"/>
+  </g>
+</svg>

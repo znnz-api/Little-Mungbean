@@ -1,9 +1,10 @@
 use crate::gateway::GatewayIdentity;
 use crate::network_proxy;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -19,14 +20,17 @@ pub async fn fetch_catalog(
     let gateway = GatewayIdentity::parse(gateway_url)?;
     let source_label = gateway.source_label();
     let endpoint = models_endpoint(gateway_url, client_version)?;
-    let client = network_proxy::builder_for_url(reqwest::Client::builder(), gateway_url)?
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(35))
-        .user_agent(format!(
-            "znnz-agent-launcher/{} codex-cli/{client_version}",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .build()?;
+    let user_agent = format!(
+        "little-mungbean/{} codex-cli/{client_version}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let client = network_proxy::Client::new(move || {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(35))
+            .user_agent(user_agent.clone())
+    })?
+    .total_timeout(Duration::from_secs(35));
 
     // Some gateways use anthropic-version to select a Claude-specific catalog
     // with route aliases instead of actual model IDs. Request the standard
@@ -47,48 +51,79 @@ pub async fn fetch_catalog(
     // Anthropic reports a missing version header as 400, not 401/403.
     // Inspect that explicit error without treating every 400 as an auth issue.
     let mut anthropic = endpoint.host_str() == Some("api.anthropic.com");
-    let (status, response_source, body) = loop {
-        let response = network_proxy::send_with_network_retry(request(anthropic))
-            .await
-            .map_err(|error| {
-                anyhow!(
-                    "{} {}: {}{}{}",
-                    crate::i18n::tr("无法连接模型接口", "Unable to connect to model endpoint"),
-                    endpoint_origin(&endpoint),
-                    error,
-                    if crate::gateway::connection_error_hint(&gateway, &error).is_empty() {
-                        ""
-                    } else {
-                        ". "
-                    },
-                    crate::gateway::connection_error_hint(&gateway, &error)
-                )
-            })?;
+    // Every catalog fetch has a strict two-request budget. Network errors,
+    // truncated bodies, transient HTTP failures, and header discovery all
+    // consume the same budget instead of layering independent retries.
+    let mut final_response = None;
+    for attempt in 0..2 {
+        let response = match request(anthropic).send().await {
+            Ok(response) => response,
+            Err(error) if !error.is_retryable() => {
+                return Err(error.into());
+            }
+            Err(_) if attempt == 0 => {
+                catalog_retry(catalog_retry_message(&endpoint)).await;
+                continue;
+            }
+            Err(_) => {
+                return Err(catalog_connection_error(&endpoint));
+            }
+        };
         let status = response.status();
         let response_source = response
             .headers()
-            .get("x-agent-switch-upstream")
+            .get("x-little-mungbean-upstream")
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let body = response.text().await.context(crate::i18n::tr(
-            "读取模型接口响应失败",
-            "Unable to read model endpoint response",
-        ))?;
-        if !anthropic && catalog_requires_anthropic_headers(status.as_u16(), &body) {
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(_) if attempt == 0 => {
+                catalog_retry(catalog_retry_message(&endpoint)).await;
+                continue;
+            }
+            Err(_) => {
+                return Err(catalog_connection_error(&endpoint));
+            }
+        };
+        if attempt == 0 && !anthropic && catalog_requires_anthropic_headers(status.as_u16(), &body)
+        {
             anthropic = true;
+            println!(
+                "{}",
+                crate::i18n::tr(
+                    "模型接口需要兼容认证头，正在重新请求（2/2）……",
+                    "The model endpoint needs compatible authentication headers; retrying (2/2)…"
+                )
+            );
             continue;
         }
-        break (status, response_source, body);
-    };
+        if is_transient_catalog_status(status.as_u16()) && attempt == 0 {
+            catalog_retry(format!(
+                "{}: HTTP {} • {}",
+                crate::i18n::tr("模型目录请求失败", "Model catalog request failed"),
+                status.as_u16(),
+                crate::i18n::tr("正在重试（2/2）……", "Retrying (2/2)…"),
+            ))
+            .await;
+            continue;
+        }
+        final_response = Some((status, response_source, body));
+        break;
+    }
+    let (status, response_source, body) = final_response.context(crate::i18n::tr(
+        "模型目录请求未返回响应",
+        "The model catalog request returned no response",
+    ))?;
     if !status.is_success() {
         let short = body.chars().take(500).collect::<String>();
         bail!(
-            "{} HTTP {}: {}",
+            "{} HTTP {}: {}{}",
             crate::i18n::tr("模型接口返回", "Model endpoint returned"),
             status.as_u16(),
-            short
+            short,
+            catalog_http_hint(status.as_u16())
         );
     }
 
@@ -112,6 +147,91 @@ pub async fn fetch_catalog(
         .unwrap_or(source_label);
     apply_online_source_description(&mut normalized, &source_label)?;
     Ok(normalized)
+}
+
+fn catalog_retry_message(endpoint: &Url) -> String {
+    format!(
+        "{}: ({}) • {}",
+        crate::i18n::tr("模型目录请求失败", "Model catalog request failed"),
+        display_catalog_endpoint(endpoint),
+        crate::i18n::tr("正在重试（2/2）……", "Retrying (2/2)…"),
+    )
+}
+
+async fn catalog_retry(message: String) {
+    println!("{message}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+#[derive(Debug)]
+struct CatalogConnectionFailure {
+    gateway_url: String,
+    endpoint: String,
+}
+
+impl fmt::Display for CatalogConnectionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}: {}  ({})\n{}",
+            crate::i18n::tr(
+                "本机网络无法连接接口地址",
+                "The local network cannot reach the gateway endpoint"
+            ),
+            self.gateway_url,
+            self.endpoint,
+            crate::i18n::tr(
+                "请检查接口地址、API Key、本机网络状态、防火墙...\n中国大陆地区用户，如果接口地址在中国大陆地区无法解析（俗称被墙），则需要配置可供本机程序使用的网络代理或 VPN 后重试...",
+                "Check the gateway URL, API key, local network status, and firewall...\nFor users in mainland China, if the gateway endpoint cannot be resolved, you may need to configure a network proxy or VPN available to local applications, then try again..."
+            )
+        )
+    }
+}
+
+impl std::error::Error for CatalogConnectionFailure {}
+
+fn catalog_connection_error(endpoint: &Url) -> anyhow::Error {
+    anyhow::Error::new(CatalogConnectionFailure {
+        gateway_url: endpoint.origin().ascii_serialization(),
+        endpoint: display_catalog_endpoint(endpoint),
+    })
+}
+
+pub fn with_catalog_fetch_context(error: anyhow::Error) -> anyhow::Error {
+    let context = if error.is::<CatalogConnectionFailure>() {
+        crate::i18n::tr(
+            "拉取网关模型目录失败；未启动或重启客户端，也未修改配置。",
+            "Failed to fetch the gateway model catalog; the client was not started or restarted, and no configuration was modified.",
+        )
+    } else {
+        crate::i18n::tr(
+            "拉取模型目录失败；未启动或重启客户端，也未修改配置。请根据下方原因检查接口地址、API Key、提供商服务和网络代理后重试",
+            "Failed to fetch the model catalog; the client was not started or restarted and its configuration is unchanged. Use the cause below to check the gateway URL, API key, provider service, and proxy, then retry.",
+        )
+    };
+    error.context(context)
+}
+
+fn catalog_http_hint(status: u16) -> &'static str {
+    match status {
+        401 | 403 => crate::i18n::tr(
+            "。请检查 API Key 是否有效，以及该 Key 是否有权访问模型目录",
+            ". Check that the API key is valid and has permission to access the model catalog",
+        ),
+        408 | 502..=504 => crate::i18n::tr(
+            "。上游服务暂时不可用；请检查提供商状态、网络代理或 VPN 后重试",
+            ". The upstream service is temporarily unavailable; check the provider status, proxy, or VPN, then retry",
+        ),
+        429 => crate::i18n::tr(
+            "。请求受到限流；请等待额度恢复或检查提供商的速率限制",
+            ". The request was rate limited; wait for quota to recover or check the provider's rate limits",
+        ),
+        _ => "",
+    }
+}
+
+fn is_transient_catalog_status(status: u16) -> bool {
+    matches!(status, 408 | 502 | 503 | 504)
 }
 
 fn strip_google_model_prefixes(value: &mut Value) {
@@ -184,7 +304,7 @@ pub fn model_menu_catalog(catalog: &Value, hidden_models: &[String]) -> Value {
             }
         }
     }
-    menu["agent_switch_hidden_models"] = json!(hidden_ids);
+    menu["little_mungbean_hidden_models"] = json!(hidden_ids);
     menu
 }
 
@@ -192,7 +312,7 @@ fn canonical_model_id(model: &str) -> String {
     model.strip_prefix("models/").unwrap_or(model).to_owned()
 }
 
-/// Model menu files are also read from older Agent-Switch versions. Normalize
+/// Model menu files are also read from older Little-Mungbean versions. Normalize
 /// the Google REST resource prefix at this boundary so a hot reattach cannot
 /// reintroduce `models/` after the online catalog was already corrected.
 fn normalize_catalog_model_ids(value: &mut Value) {
@@ -287,15 +407,16 @@ fn normalize_agent_models(value: &mut Value) -> Result<()> {
             .and_then(Value::as_str)
             .map(str::trim)
             .unwrap_or_default();
-        let reasoning_level_count = model
-            .get("supported_reasoning_levels")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
         // Codex Desktop's bundled frontier models expose the extended
         // reasoning picker.  Gateways commonly return only low/medium/high;
         // keep their model catalog, but complete the capability metadata so
         // Desktop does not collapse the picker to "High".
-        let needs_expanded_levels = supports_expanded_reasoning(slug) && reasoning_level_count < 6;
+        let needs_expanded_levels =
+            supports_expanded_reasoning(slug) && !has_expanded_reasoning_levels(model);
+        let reasoning_level_count = model
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
         let missing_levels = reasoning_level_count == 0;
         if missing_levels || needs_expanded_levels {
             model["supported_reasoning_levels"] = default_reasoning_levels_for_slug(slug);
@@ -354,8 +475,33 @@ fn default_reasoning_levels_for_slug(slug: &str) -> Value {
     }
 }
 
+fn has_expanded_reasoning_levels(model: &Value) -> bool {
+    let Some(levels) = model
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    ["low", "medium", "high", "xhigh", "max", "ultra"]
+        .iter()
+        .all(|expected| {
+            levels.iter().any(|level| {
+                let actual = if let Some(value) = level.as_str() {
+                    Some(value)
+                } else {
+                    level
+                        .get("effort")
+                        .or_else(|| level.get("reasoning_effort"))
+                        .or_else(|| level.get("reasoningEffort"))
+                        .and_then(Value::as_str)
+                };
+                actual.is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+            })
+        })
+}
+
 fn supports_expanded_reasoning(slug: &str) -> bool {
-    let lower = slug.to_ascii_lowercase();
+    let lower = slug.rsplit('/').next().unwrap_or(slug).to_ascii_lowercase();
     lower.starts_with("gpt-5")
         || lower.starts_with("gpt-6")
         || lower.starts_with("claude-")
@@ -368,6 +514,17 @@ pub fn validate_catalog(value: &Value) -> Result<()> {
 
 pub fn validate_model_menu_catalog(value: &Value) -> Result<()> {
     validate_catalog_structure(value, false)
+}
+
+pub fn validate_current_model_menu_catalog(actual: &Value, expected: &Value) -> Result<()> {
+    validate_model_menu_catalog(actual)?;
+    validate_model_menu_catalog(expected)?;
+    if actual != expected {
+        bail!(
+            "本地 Codex 模型目录与本次预检通过的网关目录不一致；已阻止启动，请重新连接以刷新目录"
+        );
+    }
+    Ok(())
 }
 
 fn validate_catalog_structure(value: &Value, require_visible: bool) -> Result<()> {
@@ -433,7 +590,13 @@ pub fn select_default_model(value: &Value, requested: Option<&str>) -> Result<St
         bail!("指定的默认模型不在当前可见模型目录中: {requested}");
     }
 
-    for preferred in ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "claude-sonnet-5"] {
+    for preferred in [
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.5",
+        "gpt-5.4",
+        "claude-sonnet-5",
+    ] {
         if visible.iter().any(|model| model == preferred) {
             return Ok(preferred.to_owned());
         }
@@ -526,12 +689,13 @@ fn is_loopback(url: &Url) -> bool {
     matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
 }
 
-fn endpoint_origin(url: &Url) -> String {
-    format!(
-        "{}://{}",
-        url.scheme(),
-        url.host_str().unwrap_or("<unknown>")
-    )
+fn display_catalog_endpoint(url: &Url) -> String {
+    let mut endpoint = url.clone();
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    let _ = endpoint.set_username("");
+    let _ = endpoint.set_password(None);
+    endpoint.to_string()
 }
 
 #[cfg(test)]
@@ -616,7 +780,7 @@ mod tests {
         );
         assert_eq!(menu["models"][0]["slug"], "gemini-3.7-flash");
         assert_eq!(menu["models"][0]["visibility"], "hide");
-        assert_eq!(menu["agent_switch_hidden_models"][0], "gemini-3.7-flash");
+        assert_eq!(menu["little_mungbean_hidden_models"][0], "gemini-3.7-flash");
     }
 
     #[test]
@@ -636,7 +800,7 @@ mod tests {
         );
         assert_eq!(
             select_default_model(&normalized, None).unwrap(),
-            "claude-fable-5"
+            "gpt-6-astra"
         );
         // Reading an already normalized local catalog must preserve it.
         assert_eq!(normalize_catalog(&normalized).unwrap(), normalized);
@@ -785,6 +949,68 @@ mod tests {
     }
 
     #[test]
+    fn provider_qualified_frontier_models_receive_expanded_reasoning_levels() {
+        let normalized = normalize_catalog(&json!({
+            "models": [{
+                "slug": "openai/gpt-6-astra",
+                "visibility": "list",
+                "supported_in_api": true,
+                "supported_reasoning_levels": [
+                    {"effort": "low"},
+                    {"effort": "medium"},
+                    {"effort": "high"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let levels = normalized["models"][0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap();
+        assert_eq!(levels.len(), 6);
+        assert_eq!(levels[5]["effort"], "ultra");
+    }
+
+    #[test]
+    fn frontier_models_with_six_entries_still_receive_missing_ultra() {
+        let normalized = normalize_catalog(&json!({
+            "models": [{
+                "slug": "gpt-6-astra",
+                "visibility": "list",
+                "supported_in_api": true,
+                "supported_reasoning_levels": [
+                    {"effort": "low"},
+                    {"effort": "medium"},
+                    {"effort": "high"},
+                    {"effort": "xhigh"},
+                    {"effort": "max"},
+                    {"effort": "custom"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let levels = normalized["models"][0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap();
+        assert_eq!(levels.len(), 6);
+        assert_eq!(levels[5]["effort"], "ultra");
+    }
+
+    #[test]
+    fn current_model_menu_must_match_the_preflight_catalog() {
+        let expected = model_menu_catalog(
+            &normalize_catalog(&json!({"data":[{"id":"gpt-test"}]})).unwrap(),
+            &[],
+        );
+        validate_current_model_menu_catalog(&expected, &expected).unwrap();
+
+        let stale = model_menu_catalog(
+            &normalize_catalog(&json!({"data":[{"id":"gpt-old"}]})).unwrap(),
+            &[],
+        );
+        assert!(validate_current_model_menu_catalog(&stale, &expected).is_err());
+    }
+
+    #[test]
     fn requested_default_model_must_be_visible() {
         let catalog = json!({"models": [{"slug": "model-a"}]});
         assert_eq!(
@@ -839,5 +1065,83 @@ mod tests {
                 .as_str(),
             "https://gateway.example.com/v1/models"
         );
+    }
+
+    #[test]
+    fn catalog_failure_urls_hide_queries_and_preserve_ports_and_api_paths() {
+        let endpoint = Url::parse(
+            "https://user:secret@gateway.example.com:8443/custom/v1/models?key=secret#fragment",
+        )
+        .unwrap();
+        let error = catalog_connection_error(&endpoint);
+        let detail = crate::i18n::runtime_log_error(&error);
+        assert!(detail.contains("请检查接口地址、API Key、本机网络状态、防火墙"));
+        assert!(detail.contains("中国大陆地区用户"));
+        assert!(detail.contains("网络代理或 VPN 后重试"));
+        assert!(detail.starts_with(
+            "本机网络无法连接接口地址: https://gateway.example.com:8443  (https://gateway.example.com:8443/custom/v1/models)\n"
+        ));
+        assert!(!detail.contains("secret"));
+        assert!(!detail.contains("fragment"));
+        assert!(!detail.contains("user:"));
+
+        let endpoint = models_endpoint("https://api.znnz.net", "0.145.0").unwrap();
+        assert_eq!(
+            catalog_retry_message(&endpoint),
+            "模型目录请求失败: (https://api.znnz.net/v1/models) • 正在重试（2/2）……"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_transport_failures_retry_once_and_share_button_and_launch_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        for response in [
+            "",
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let read = socket.read(&mut request).await.unwrap();
+                    assert!(read > 0, "expected a model catalog request");
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+            });
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                fetch_catalog(&format!("http://{address}"), "test-key", "test"),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            upstream.await.unwrap();
+            assert!(error.is::<CatalogConnectionFailure>());
+            let button_error = crate::i18n::runtime_log_error(&error);
+            assert!(button_error.contains("请检查接口地址、API Key、本机网络状态、防火墙"));
+            assert!(button_error.contains("中国大陆地区用户"));
+            assert!(button_error.contains("网络代理或 VPN 后重试"));
+            assert!(!button_error.contains("error sending request"));
+            let launch_error = crate::i18n::runtime_log_error(&with_catalog_fetch_context(error));
+            assert_eq!(
+                launch_error,
+                format!("拉取网关模型目录失败；未启动或重启客户端，也未修改配置。\n{button_error}")
+            );
+        }
+    }
+
+    #[test]
+    fn retries_only_transient_catalog_statuses() {
+        for status in [408, 502, 503, 504] {
+            assert!(is_transient_catalog_status(status));
+        }
+        for status in [200, 400, 401, 403, 404, 429, 500] {
+            assert!(!is_transient_catalog_status(status));
+        }
     }
 }

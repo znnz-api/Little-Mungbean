@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "znnz-agent-launcher",
-    version,
-    about = "Agent-Switch local AI gateway manager for Codex and Claude clients"
+    name = "little-mungbean",
+    version = crate::APP_VERSION,
+    about = "Little-Mungbean local AI gateway manager for Codex and Claude clients"
 )]
 pub struct Cli {
     /// 默认网关地址，可被子命令中的同名参数覆盖。
@@ -39,7 +39,7 @@ pub enum Command {
         claude_home: Option<PathBuf>,
         #[arg(long, default_value = crate::gateway::DEFAULT_GATEWAY_URL)]
         gateway_url: String,
-        #[arg(long, env = "ZNNZ_API_KEY", hide_env_values = true)]
+        #[arg(long, env = "LITTLE_MUNGBEAN_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
         /// 可选默认模型；未指定时从网关的可见对话模型中自动选择。
         #[arg(long)]
@@ -63,7 +63,7 @@ pub enum Command {
         codex_home: Option<PathBuf>,
         #[arg(long, default_value = crate::gateway::DEFAULT_GATEWAY_URL)]
         gateway_url: String,
-        #[arg(long, env = "ZNNZ_API_KEY", hide_env_values = true)]
+        #[arg(long, env = "LITTLE_MUNGBEAN_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
         #[arg(long)]
         dry_run: bool,
@@ -76,7 +76,7 @@ pub enum Command {
         codex_home: Option<PathBuf>,
         #[arg(long, default_value = crate::gateway::DEFAULT_GATEWAY_URL)]
         gateway_url: String,
-        #[arg(long, env = "ZNNZ_API_KEY", hide_env_values = true)]
+        #[arg(long, env = "LITTLE_MUNGBEAN_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
         /// 独立安装版 Codex Desktop 的可执行文件；Store 版通常不需要。
         #[arg(long)]
@@ -128,6 +128,16 @@ pub enum Command {
     /// GUI 内部常驻本地网关服务。
     #[command(hide = true)]
     InternalGateway,
+    /// macOS-only helper that launches a Desktop client through LaunchServices.
+    #[command(hide = true)]
+    InternalDesktopLaunch {
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long = "target-arg", allow_hyphen_values = true)]
+        target_args: Vec<String>,
+        #[arg(long = "unset-env")]
+        unset_environment: Vec<String>,
+    },
     /// Read-only process detection diagnostics; never changes client configuration.
     #[command(hide = true)]
     InternalClientStatus,
@@ -147,7 +157,7 @@ pub enum ClaudeDesktopCommand {
     Diagnose {
         #[arg(long, default_value = crate::gateway::DEFAULT_GATEWAY_URL)]
         gateway_url: String,
-        #[arg(long, env = "ZNNZ_API_KEY", hide_env_values = true)]
+        #[arg(long, env = "LITTLE_MUNGBEAN_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
         /// 同时连接网关，验证模型目录并显示自动选择的四个模型槽位。
         #[arg(long)]
@@ -157,7 +167,7 @@ pub enum ClaudeDesktopCommand {
     Launch {
         #[arg(long, default_value = crate::gateway::DEFAULT_GATEWAY_URL)]
         gateway_url: String,
-        #[arg(long, env = "ZNNZ_API_KEY", hide_env_values = true)]
+        #[arg(long, env = "LITTLE_MUNGBEAN_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
         #[arg(long)]
         haiku_model: Option<String>,
@@ -181,7 +191,7 @@ mod tests {
 
     #[test]
     fn launch_restart_is_parsed() {
-        let cli = Cli::try_parse_from(["znnz-client", "launch", "--restart"]).unwrap();
+        let cli = Cli::try_parse_from(["little-mungbean-client", "launch", "--restart"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Launch { restart: true, .. })
@@ -191,7 +201,7 @@ mod tests {
     #[test]
     fn internal_run_model_list_mode_is_parsed() {
         let cli = Cli::try_parse_from([
-            "znnz-client",
+            "little-mungbean-client",
             "internal-run",
             "claude-desktop",
             "--model-list-mode",
@@ -210,8 +220,12 @@ mod tests {
 
     #[test]
     fn internal_install_client_is_parsed() {
-        let cli =
-            Cli::try_parse_from(["znnz-client", "internal-install-client", "claude-code"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "little-mungbean-client",
+            "internal-install-client",
+            "claude-code",
+        ])
+        .unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::InternalInstallClient {
@@ -223,7 +237,7 @@ mod tests {
     #[test]
     fn claude_desktop_full_model_list_is_parsed() {
         let cli = Cli::try_parse_from([
-            "znnz-client",
+            "little-mungbean-client",
             "claude-desktop",
             "launch",
             "--full-model-list",

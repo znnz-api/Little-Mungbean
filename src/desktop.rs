@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
+#[cfg(not(target_os = "macos"))]
 use tokio::process::{Child, Command};
 use tracing::{info, warn};
 
@@ -19,33 +20,37 @@ const RESTART_WINDOW_GRACE: Duration = Duration::from_secs(3);
 const RESTART_TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum DesktopLaunch {
+    #[cfg(not(target_os = "macos"))]
     Standalone(Box<Child>),
-    Store { pid: u32 },
+    #[cfg(target_os = "macos")]
+    Detached {
+        pid: u32,
+        executable: std::path::PathBuf,
+    },
+    Store {
+        pid: u32,
+    },
 }
 
 impl DesktopLaunch {
-    fn description(&self) -> String {
+    fn pid(&self) -> u32 {
         match self {
-            Self::Standalone(child) => {
-                if i18n::language() == i18n::Language::ZhCn {
-                    format!("独立版 PID {}", child.id().unwrap_or_default())
-                } else {
-                    format!("standalone PID {}", child.id().unwrap_or_default())
-                }
-            }
-            Self::Store { pid } => {
-                if i18n::language() == i18n::Language::ZhCn {
-                    format!("Microsoft Store 版 PID {pid}")
-                } else {
-                    format!("Microsoft Store PID {pid}")
-                }
-            }
+            #[cfg(not(target_os = "macos"))]
+            Self::Standalone(child) => child.id().unwrap_or_default(),
+            #[cfg(target_os = "macos")]
+            Self::Detached { pid, .. } => *pid,
+            Self::Store { pid } => *pid,
         }
     }
 
     fn exited(&mut self) -> Result<bool> {
         match self {
+            #[cfg(not(target_os = "macos"))]
             Self::Standalone(child) => Ok(child.try_wait()?.is_some()),
+            #[cfg(target_os = "macos")]
+            Self::Detached { pid, executable } => {
+                Ok(!platform::process_matches_image(*pid, executable))
+            }
             // Store/Electron may hand the activation PID to another process; do not rely on that PID alone.
             Self::Store { .. } => Ok(false),
         }
@@ -328,8 +333,41 @@ pub async fn restart_running_desktop() -> Result<()> {
 pub async fn launch_and_inject(
     paths: &ClientPaths,
     gateway_url: &str,
-    _api_key: &str,
+    api_key: &str,
     desktop_exe: Option<&Path>,
+) -> Result<()> {
+    launch_and_inject_inner(paths, gateway_url, api_key, gateway_url, desktop_exe, None).await
+}
+
+pub async fn launch_and_inject_with_catalog(
+    paths: &ClientPaths,
+    gateway_url: &str,
+    api_key: &str,
+    display_gateway_url: &str,
+    gateway_catalog: &serde_json::Value,
+    hidden_models: &[String],
+    desktop_exe: Option<&Path>,
+) -> Result<()> {
+    let expected_catalog = catalog::model_menu_catalog(gateway_catalog, hidden_models);
+    catalog::validate_model_menu_catalog(&expected_catalog)?;
+    launch_and_inject_inner(
+        paths,
+        gateway_url,
+        api_key,
+        display_gateway_url,
+        desktop_exe,
+        Some(&expected_catalog),
+    )
+    .await
+}
+
+async fn launch_and_inject_inner(
+    paths: &ClientPaths,
+    gateway_url: &str,
+    api_key: &str,
+    display_gateway_url: &str,
+    desktop_exe: Option<&Path>,
+    expected_catalog: Option<&serde_json::Value>,
 ) -> Result<()> {
     let gateway = GatewayIdentity::parse(gateway_url)?;
     let catalog_value = catalog::read_model_menu_catalog(&paths.codex_catalog).with_context(|| {
@@ -345,6 +383,14 @@ pub async fn launch_and_inject(
             )
         }
     })?;
+    if let Some(expected) = expected_catalog {
+        catalog::validate_current_model_menu_catalog(&catalog_value, expected).with_context(|| {
+            i18n::tr(
+                "Codex Desktop 启动前模型目录校验失败；客户端未启动",
+                "Codex Desktop model catalog validation failed before launch; the client was not started",
+            )
+        })?;
+    }
     let default_model = selected_model(&paths.codex_config)
         .or_else(|| catalog::visible_slugs(&catalog_value).into_iter().next());
     let helper = Helper::start(catalog_value.clone()).await?;
@@ -357,40 +403,23 @@ pub async fn launch_and_inject(
     let debug_port = cdp::reserve_loopback_port()?;
 
     let session = async {
-        let mut launch = launch_desktop(paths, desktop_exe, debug_port).await?;
-        println!(
-            "{} Codex Desktop ({})",
-            i18n::tr("已启动", "Started"),
-            launch.description()
-        );
+        let mut launch =
+            launch_desktop(paths, gateway_url, api_key, desktop_exe, debug_port).await?;
+        let mut injected =
+            wait_for_initial_injection(debug_port, &renderer_injection, &mut launch).await?;
+        crate::local_gateway::confirm_current_worker(
+            crate::gui_worker::ClientTarget::CodexDesktop,
+        )?;
         println!(
             "{}",
-            i18n::tr(
-                "正在等待模型选择器注入，请不要关闭本窗口……",
-                "Waiting for model picker injection. Do not close this window…"
+            crate::gui_worker::client_started_message(
+                crate::gui_worker::ClientTarget::CodexDesktop,
+                launch.pid(),
+                display_gateway_url,
+                crate::gui_worker::ModelListMode::Gateway,
             )
         );
-
-        let mut injected = wait_for_initial_injection(debug_port, &renderer_injection, &mut launch).await?;
-        crate::local_gateway::confirm_current_worker(crate::gui_worker::ClientTarget::CodexDesktop)?;
-        println!(
-            "{}",
-            if i18n::language() == i18n::Language::ZhCn {
-                format!("已向 {} 个渲染页面成功注入模型目录；请在 Codex Desktop 中选择网关模型。", injected.len())
-            } else {
-                format!(
-                    "Model injection succeeded for {} rendered page(s); select a gateway model in Codex Desktop.",
-                    injected.len()
-                )
-            }
-        );
-        println!(
-            "{}",
-            i18n::tr(
-                "模型目录已接入，正在后台维护。",
-                "The model catalog is connected and maintained in the background."
-            )
-        );
+        log_connected_configuration(paths, gateway_url);
 
         watchdog(debug_port, &renderer_injection, &mut launch, &mut injected).await
     }
@@ -402,29 +431,47 @@ pub async fn launch_and_inject(
 
 pub async fn launch_without_injection(
     paths: &ClientPaths,
+    gateway_url: &str,
+    api_key: &str,
+    display_gateway_url: &str,
     desktop_exe: Option<&Path>,
 ) -> Result<()> {
     let debug_port = cdp::reserve_loopback_port()?;
-    let mut launch = launch_desktop(paths, desktop_exe, debug_port).await?;
-    println!(
-        "{} Codex Desktop ({})",
-        i18n::tr("已启动", "Started"),
-        launch.description()
-    );
-    println!(
-        "{}",
-        i18n::tr(
-            "当前使用默认模型列表；不会注入网关模型目录。",
-            "Using the default model list; the gateway catalog will not be injected."
-        )
-    );
+    let mut launch = launch_desktop(paths, gateway_url, api_key, desktop_exe, debug_port).await?;
     wait_for_desktop_ready(debug_port, &mut launch).await?;
     crate::local_gateway::confirm_current_worker(crate::gui_worker::ClientTarget::CodexDesktop)?;
     println!(
         "{}",
-        i18n::tr("Codex Desktop 已启动。", "Codex Desktop started.")
+        crate::gui_worker::client_started_message(
+            crate::gui_worker::ClientTarget::CodexDesktop,
+            launch.pid(),
+            display_gateway_url,
+            crate::gui_worker::ModelListMode::BuiltIn,
+        )
     );
+    log_connected_configuration(paths, gateway_url);
     watch_desktop_exit(debug_port, &mut launch).await
+}
+
+fn log_connected_configuration(paths: &ClientPaths, listening_address: &str) {
+    println!(
+        "{}",
+        i18n::tr(
+            "Codex Desktop 已自动接入 Little Mungbean 本地网关。",
+            "Codex Desktop is connected to the Little Mungbean local gateway."
+        )
+    );
+    println!(
+        "{}：{}",
+        i18n::tr("配置目录", "Configuration directory"),
+        paths.codex_home.display()
+    );
+    println!(
+        "{}：{}",
+        i18n::tr("监听地址", "Listening address"),
+        listening_address
+    );
+    println!("{}", crate::gui_worker::connection_token_hint());
 }
 
 async fn wait_for_desktop_ready(debug_port: u16, launch: &mut DesktopLaunch) -> Result<()> {
@@ -494,9 +541,13 @@ async fn watch_desktop_exit(debug_port: u16, launch: &mut DesktopLaunch) -> Resu
 
 async fn launch_desktop(
     paths: &ClientPaths,
+    gateway_url: &str,
+    api_key: &str,
     desktop_exe: Option<&Path>,
     debug_port: u16,
 ) -> Result<DesktopLaunch> {
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = (gateway_url, api_key);
     if config::remove_codex_desktop_locale_override(&paths.codex_config)? {
         println!(
             "{}",
@@ -510,6 +561,16 @@ async fn launch_desktop(
         format!("--remote-debugging-port={debug_port}"),
         format!("--remote-allow-origins=http://127.0.0.1:{debug_port}"),
     ];
+    #[cfg(target_os = "macos")]
+    let macos_executable = if desktop_exe.is_none() {
+        Some(platform::desktop_executable(
+            crate::gui_worker::ClientTarget::CodexDesktop,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let desktop_exe = desktop_exe.or(macos_executable.as_deref());
     if let Some(executable) = desktop_exe {
         if !executable.is_file() {
             bail!(
@@ -517,17 +578,46 @@ async fn launch_desktop(
                 executable.display()
             )
         }
-        let child = Command::new(executable)
-            .args(&flags)
-            .env("CODEX_HOME", &paths.codex_home)
-            .spawn()
-            .with_context(|| {
-                if i18n::language() == i18n::Language::ZhCn {
-                    format!("无法启动 {}", executable.display())
-                } else {
-                    format!("Unable to start {}", executable.display())
-                }
-            })?;
+        #[cfg(target_os = "macos")]
+        let pid = platform::spawn_desktop_detached(executable, &flags, |command| {
+            platform::configure_codex_desktop_environment(
+                command,
+                &paths.codex_home,
+                Some((gateway_url, api_key)),
+            );
+        })
+        .await
+        .with_context(|| {
+            if i18n::language() == i18n::Language::ZhCn {
+                format!("无法启动 {}", executable.display())
+            } else {
+                format!("Unable to start {}", executable.display())
+            }
+        })?;
+        #[cfg(target_os = "macos")]
+        return Ok(DesktopLaunch::Detached {
+            pid,
+            executable: executable.to_path_buf(),
+        });
+        #[cfg(not(target_os = "macos"))]
+        let mut command = Command::new(executable);
+        #[cfg(not(target_os = "macos"))]
+        command.args(&flags);
+        #[cfg(windows)]
+        platform::configure_codex_desktop_environment(
+            &mut command,
+            &paths.codex_home,
+            Some((gateway_url, api_key)),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let child = command.spawn().with_context(|| {
+            if i18n::language() == i18n::Language::ZhCn {
+                format!("无法启动 {}", executable.display())
+            } else {
+                format!("Unable to start {}", executable.display())
+            }
+        })?;
+        #[cfg(not(target_os = "macos"))]
         return Ok(DesktopLaunch::Standalone(Box::new(child)));
     }
 
@@ -574,7 +664,7 @@ async fn wait_for_initial_injection(
                 )
             )
         }
-        match cdp::inject_all(debug_port, renderer_injection).await {
+        match cdp::inject_all_catalog(debug_port, renderer_injection).await {
             Ok(targets) => return Ok(targets),
             Err(error) => last_error = Some(error),
         }
@@ -596,6 +686,7 @@ async fn watchdog(
     injected: &mut HashSet<String>,
 ) -> Result<()> {
     let mut missed = 0usize;
+    let mut request_client_ready = HashSet::new();
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
@@ -680,29 +771,43 @@ async fn watchdog(
         };
 
         for target in targets {
-            let healthy = if injected.contains(&target.id) {
-                cdp::target_health(&target, debug_port, renderer_injection)
+            let catalog_ready = if injected.contains(&target.id) {
+                cdp::target_catalog_health(&target, debug_port, renderer_injection)
                     .await
                     .unwrap_or(false)
             } else {
                 false
             };
-            if healthy {
+            if catalog_ready {
+                if !request_client_ready.contains(&target.id)
+                    && cdp::target_health(&target, debug_port, renderer_injection)
+                        .await
+                        .unwrap_or(false)
+                {
+                    request_client_ready.insert(target.id.clone());
+                    info!(
+                        "{}",
+                        i18n::tr(
+                            "Codex Desktop 模型请求客户端已挂载",
+                            "Codex Desktop model request client is attached"
+                        )
+                    );
+                }
                 continue;
             }
-            match cdp::inject_target(&target, debug_port, renderer_injection).await {
+            match cdp::inject_target_catalog(&target, debug_port, renderer_injection).await {
                 Ok(()) => {
                     if injected.insert(target.id.clone()) {
                         if i18n::language() == i18n::Language::ZhCn {
-                            info!("已向新渲染页面 {} 注入模型目录", target.id);
+                            info!("已将模型目录加载到新渲染页面 {}", target.id);
                         } else {
                             info!(
-                                "Injected the model catalog into new rendered page {}",
+                                "Loaded the model catalog into new rendered page {}",
                                 target.id
                             );
                         }
                     } else {
-                        info!("Restored model injection for target {}", target.id);
+                        info!("Restored the model catalog for target {}", target.id);
                     }
                 }
                 Err(error) => {

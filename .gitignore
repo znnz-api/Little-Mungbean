@@ -1,26 +1,23 @@
 /target/
-/dist/
 /release/
 /cloudflare/
 /assets/gui/-bak/
-/imgs/Agent-Switch-en/jpg/
-/imgs/Agent-Switch-zh/jpg/
+/imgs/*/jpg/
+/docs/
+/tests/legacy/
 /*.log
 /*.tmp
 /.idea/
 /.vscode/
 .DS_Store
-Thumbs.db
-
-# Local credentials and runtime state
+._*
+__MACOSX/
 .env
-*.local.ps1
 .env.*
 !.env.example
+*.local.ps1
 *api-key*
 *.dpapi
-
-# Developer-only captures and installer payloads
 /examples/*.jsonl
 /downloads/
 /installers/

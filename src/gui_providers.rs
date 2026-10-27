@@ -26,6 +26,27 @@ pub struct Provider {
     /// Optional local-time expiration in `YYYY/MM/DD-HH:MM` format.
     #[serde(default, alias = "expires_at", alias = "valid_until")]
     pub expires: Option<String>,
+    #[serde(default)]
+    pub show_in: ProviderVisibility,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderVisibility {
+    #[default]
+    ProviderPresets,
+    About,
+    Both,
+}
+
+impl ProviderVisibility {
+    pub fn provider_presets(self) -> bool {
+        matches!(self, Self::ProviderPresets | Self::Both)
+    }
+
+    pub fn about(self) -> bool {
+        matches!(self, Self::About | Self::Both)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +58,7 @@ struct Manifest {
 struct ProviderRecord {
     id: String,
     name: String,
+    #[serde(default)]
     endpoint: String,
     icon: String,
     #[serde(default)]
@@ -49,9 +71,16 @@ struct ProviderRecord {
     protocols: Option<Vec<String>>,
     #[serde(default, alias = "expires_at", alias = "valid_until")]
     expires: Option<String>,
+    #[serde(default)]
+    show_in: ProviderVisibility,
 }
 
 fn cache_root() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return crate::platform_paths::cache_root()
+        .ok()
+        .map(|p| p.join("provider-cache"));
+    #[cfg(not(target_os = "macos"))]
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| {
@@ -59,7 +88,7 @@ fn cache_root() -> Option<PathBuf> {
                 .map(PathBuf::from)
                 .map(|p| p.join("AppData").join("Local"))
         })
-        .map(|root| root.join("Agent-Switch").join("provider-cache"))
+        .map(|root| root.join("Little-Mungbean").join("provider-cache"))
 }
 
 fn language_matches(lang: Option<&str>) -> bool {
@@ -152,7 +181,26 @@ fn local_date_time() -> (u16, u8, u8, u8, u8) {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn local_date_time() -> (u16, u8, u8, u8, u8) {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    crate::platform::local_time(ms)
+        .map(|t| {
+            (
+                (t.tm_year + 1900) as u16,
+                (t.tm_mon + 1) as u8,
+                t.tm_mday as u8,
+                t.tm_hour as u8,
+                t.tm_min as u8,
+            )
+        })
+        .unwrap_or((1970, 1, 1, 0, 0))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn local_date_time() -> (u16, u8, u8, u8, u8) {
     // Non-Windows builds are only used for development/tests. UTC is a stable
     // fallback there; release builds run on Windows and use GetLocalTime.
@@ -194,13 +242,21 @@ fn validate_https(value: &str, label: &str) -> Result<Url> {
     Ok(url)
 }
 
+fn optional_website(value: Option<&str>) -> Result<Option<String>> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| validate_https(value, "提供商网址").map(|_| value.to_owned()))
+        .transpose()
+}
+
 pub async fn fetch() -> Result<Vec<Provider>> {
-    let client = crate::network_proxy::configure_reqwest_builder(
+    let client = crate::network_proxy::Client::new(|| {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(8))
-            .timeout(std::time::Duration::from_secs(15)),
-    )?
-    .build()?;
+            .timeout(std::time::Duration::from_secs(15))
+    })?
+    .total_timeout(std::time::Duration::from_secs(15));
     let response = crate::network_proxy::send_with_network_retry(
         client
             .get(MANIFEST_URL)
@@ -223,16 +279,15 @@ pub async fn fetch() -> Result<Vec<Provider>> {
         .filter(|p| language_matches(p.lang.as_deref()))
         .filter(|p| expiration_matches(p.expires.as_deref()))
     {
+        if record.show_in.provider_presets() && record.endpoint.trim().is_empty() {
+            bail!("提供商预设 {} 缺少 endpoint", record.id);
+        }
         let icon_url = root
             .join(&record.icon)
             .or_else(|_| Url::parse(&record.icon))
             .context("提供商图标 URL 无效")?;
         validate_https(icon_url.as_str(), "提供商图标")?;
-        let website = record
-            .website
-            .as_deref()
-            .map(|value| validate_https(value, "提供商网址").map(|_| value.to_owned()))
-            .transpose()?;
+        let website = optional_website(record.website.as_deref())?;
         let icon_bytes = match client.get(icon_url.clone()).send().await {
             Ok(response) if response.status().is_success() => response.bytes().await?.to_vec(),
             _ => cached
@@ -252,6 +307,7 @@ pub async fn fetch() -> Result<Vec<Provider>> {
             api_path_mode: record.api_path_mode,
             protocols: record.protocols,
             expires: record.expires,
+            show_in: record.show_in,
         });
     }
     save_cache(&providers)?;
@@ -277,7 +333,38 @@ fn save_cache(providers: &[Provider]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expiration_matches, language_matches, parse_expiration};
+    use super::{
+        ProviderRecord, ProviderVisibility, expiration_matches, language_matches, optional_website,
+        parse_expiration,
+    };
+
+    #[test]
+    fn both_surfaces_allow_missing_empty_or_null_websites() {
+        for value in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("  ")),
+        ] {
+            let mut record = serde_json::json!({
+                "id": "znnz", "name": "znnz.net", "endpoint": "https://api.znnz.net/v1",
+                "icon": "/icons/znnz.net.svg", "show_in": "both", "lang": "zh"
+            });
+            if let Some(value) = value {
+                record["website"] = value;
+            }
+            let record: ProviderRecord = serde_json::from_value(record).unwrap();
+            assert!(record.show_in.provider_presets() && record.show_in.about());
+            assert_eq!(optional_website(record.website.as_deref()).unwrap(), None);
+        }
+        assert_eq!(
+            optional_website(Some(" https://znnz.net/ "))
+                .unwrap()
+                .as_deref(),
+            Some("https://znnz.net/")
+        );
+        assert!(optional_website(Some("javascript:alert(1)")).is_err());
+    }
 
     #[test]
     fn provider_language_requires_an_explicit_language() {
@@ -305,5 +392,25 @@ mod tests {
         assert!(parse_expiration("2026-12-03 12:00").is_none());
         assert!(parse_expiration("2026/02/30-12:00").is_none());
         assert!(expiration_matches(None));
+    }
+
+    #[test]
+    fn provider_visibility_defaults_to_presets_and_supports_both_surfaces() {
+        #[derive(serde::Deserialize)]
+        struct VisibilityField {
+            #[serde(default)]
+            show_in: ProviderVisibility,
+        }
+        let defaults: VisibilityField = serde_json::from_str("{}").unwrap();
+        assert!(defaults.show_in.provider_presets());
+        assert!(!defaults.show_in.about());
+
+        let about: ProviderVisibility = serde_json::from_str("\"about\"").unwrap();
+        assert!(!about.provider_presets());
+        assert!(about.about());
+
+        let both: ProviderVisibility = serde_json::from_str("\"both\"").unwrap();
+        assert!(both.provider_presets());
+        assert!(both.about());
     }
 }

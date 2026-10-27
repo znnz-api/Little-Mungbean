@@ -9,7 +9,7 @@ use tracing::warn;
 const RUNTIME_SCHEMA: u32 = 1;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_FRESHNESS: Duration = Duration::from_secs(8);
-const RUNTIME_LOG_PATH_ENV: &str = "ZNNZ_RUNTIME_LOG_PATH";
+const RUNTIME_LOG_PATH_ENV: &str = "LITTLE_MUNGBEAN_RUNTIME_LOG_PATH";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientRuntimeState {
@@ -39,7 +39,7 @@ impl ClientRuntimeState {
                 .unwrap_or_default(),
             executable_path: std::env::current_exe()
                 .context("无法确定后台工作进程的可执行文件路径")?,
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: crate::APP_VERSION.to_owned(),
         })
     }
 
@@ -67,8 +67,15 @@ pub async fn run_registered<F>(
 where
     F: Future<Output = Result<()>>,
 {
+    let worker_mutex = acquire_worker_mutex(target)?;
+    run_registered_with_mutex(target, model_list_mode, future, worker_mutex).await
+}
+
+pub(crate) fn acquire_worker_mutex(
+    target: ClientTarget,
+) -> Result<crate::platform::NamedMutexGuard> {
     let mutex_name = format!(
-        r"Local\Agent-Switch-worker-{}{}",
+        r"Local\Little-Mungbean-worker-{}{}",
         if crate::background::is_managed() {
             "v3-"
         } else {
@@ -76,10 +83,33 @@ where
         },
         target.id()
     );
-    let _worker_mutex = crate::platform::try_acquire_named_mutex(&mutex_name)?
-        .ok_or_else(|| anyhow::anyhow!("{} 已经由 Agent-Switch 后台进程维护", target.title()))?;
+    crate::platform::try_acquire_named_mutex(&mutex_name)?
+        .ok_or_else(|| anyhow::anyhow!("{} 已经由 Little-Mungbean 后台进程维护", target.title()))
+}
 
+pub(crate) async fn run_registered_with_mutex<F>(
+    target: ClientTarget,
+    model_list_mode: ModelListMode,
+    future: F,
+    worker_mutex: crate::platform::NamedMutexGuard,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
     let path = state_path(target)?;
+    run_registered_at(target, model_list_mode, future, worker_mutex, path).await
+}
+
+async fn run_registered_at<F>(
+    target: ClientTarget,
+    model_list_mode: ModelListMode,
+    future: F,
+    _worker_mutex: crate::platform::NamedMutexGuard,
+    path: PathBuf,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
     let mut state = ClientRuntimeState::new(target, model_list_mode)?;
     write_state(&path, &state)?;
     let _file_guard = RuntimeFileGuard {
@@ -190,16 +220,13 @@ fn remove_state_if_owned(path: &Path, worker_pid: u32) {
 }
 
 fn runtime_root() -> Result<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .context("无法确定 LOCALAPPDATA")?;
-    Ok(local
-        .join("Agent-Switch")
-        .join(if crate::background::is_managed() {
+    Ok(
+        crate::platform_paths::data_root()?.join(if crate::background::is_managed() {
             "runtime-v3"
         } else {
             "runtime"
-        }))
+        }),
+    )
 }
 
 fn state_path(target: ClientTarget) -> Result<PathBuf> {
@@ -222,6 +249,65 @@ fn current_time_ms() -> u64 {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_gui_lock_allows_registered_codex_worker_and_cleans_up_after_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "little-mungbean-registration-{}",
+            rand::random::<u64>()
+        ));
+        let gui =
+            crate::platform::try_acquire_named_mutex_at(&root, r"Local\Little-Mungbean-gui-v1")
+                .unwrap()
+                .unwrap();
+        let name = r"Local\Little-Mungbean-worker-v3-codex-desktop";
+        let worker = crate::platform::try_acquire_named_mutex_at(&root, name)
+            .unwrap()
+            .unwrap();
+        let path = root.join("codex-desktop.json");
+        let result = run_registered_at(
+            ClientTarget::CodexDesktop,
+            ModelListMode::Gateway,
+            async {
+                let state: ClientRuntimeState =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(state.version, crate::APP_VERSION);
+                assert_eq!(state.client, ClientTarget::CodexDesktop);
+                assert!(
+                    crate::platform::try_acquire_named_mutex_at(&root, name)
+                        .unwrap()
+                        .is_none()
+                );
+                anyhow::bail!("simulated desktop launch failure")
+            },
+            worker,
+            path.clone(),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("simulated desktop launch failure")
+        );
+        assert!(
+            !path.exists(),
+            "failed workers must remove their runtime registration"
+        );
+        assert!(
+            crate::platform::try_acquire_named_mutex_at(&root, name)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::platform::try_acquire_named_mutex_at(&root, r"Local\Little-Mungbean-gui-v1")
+                .unwrap()
+                .is_none()
+        );
+        drop(gui);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn sample_state(target: ClientTarget) -> ClientRuntimeState {
         ClientRuntimeState {
             schema: RUNTIME_SCHEMA,
@@ -231,7 +317,7 @@ mod tests {
             started_at_ms: 10_000,
             heartbeat_ms: 12_000,
             log_path: PathBuf::from(r"C:\Temp\worker.log"),
-            executable_path: PathBuf::from(r"C:\Tools\znnz-client.exe"),
+            executable_path: PathBuf::from(r"C:\Tools\little-mungbean-client.exe"),
             version: "0.9.19".to_owned(),
         }
     }

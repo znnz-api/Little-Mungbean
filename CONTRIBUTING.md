@@ -11,9 +11,9 @@ Run these checks before submitting:
 
 ```powershell
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
-node --test tests/renderer-inject.test.js
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+node --test tests/renderer-inject.test.js tests/model_menu_smoke.cjs
 ```
 
 When changing configuration, registry, installers, or authentication, include relevant tests.

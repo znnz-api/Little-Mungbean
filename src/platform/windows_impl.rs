@@ -48,6 +48,8 @@ use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
 
 const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
+const CLAUDE_STORE_PACKAGE_FAMILIES: &[&str] =
+    &["AnthropicPBC.Claude_fnn82j28hfe8t", "Claude_pzs8sxrjxfjjc"];
 const WTD_CACHE_ONLY_URL_RETRIEVAL_FLAG: WINTRUST_DATA_PROVIDER_FLAGS =
     WINTRUST_DATA_PROVIDER_FLAGS(0x0000_1000);
 
@@ -62,7 +64,7 @@ fn gui_startup_error_log_path() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("Agent-Switch")
+        .join("Little-Mungbean")
         .join("logs")
         .join("gui-startup-error.log")
 }
@@ -86,10 +88,10 @@ pub fn report_gui_startup_failure(message: &str) {
     }
 
     let text = format!(
-        "Agent-Switch failed to start the GUI.\r\n\r\n{message}\r\n\r\nLog: {}",
+        "Little Mungbean failed to start the GUI.\r\n\r\n{message}\r\n\r\nLog: {}",
         log_path.display()
     );
-    let title_text = crate::i18n::tr("Agent-Switch 启动失败", "Agent-Switch startup failed");
+    let title_text = crate::i18n::tr("Little Mungbean 启动失败", "Little Mungbean startup failed");
     let title = wide_null(std::ffi::OsStr::new(title_text));
     let body = wide_null(text.as_ref());
     unsafe {
@@ -403,7 +405,11 @@ pub fn process_image_path(pid: u32) -> Result<String> {
 
 fn is_official_claude_desktop_path(path: &str) -> bool {
     let normalized = path.replace('/', "\\").to_ascii_lowercase();
-    normalized.contains("\\windowsapps\\claude_") && normalized.ends_with("\\app\\claude.exe")
+    normalized.ends_with("\\app\\claude.exe")
+        && CLAUDE_STORE_PACKAGE_FAMILIES.iter().any(|family| {
+            let package_name = family.split_once('_').unwrap().0.to_ascii_lowercase();
+            normalized.contains(&format!("\\windowsapps\\{package_name}_"))
+        })
 }
 
 pub fn running_claude_desktop_process_ids() -> Result<Vec<u32>> {
@@ -776,8 +782,8 @@ impl TerminalRestartSession {
                     bail!(
                         "{} ({image})",
                         crate::i18n::tr(
-                            "终端中有其他子程序运行，请手动重启",
-                            "Other programs are running in the terminal; restart it manually"
+                            "终端中有其他子程序运行，无法自动重启。子程序:",
+                            "Other programs are running in the terminal; automatic restart is unavailable. Subprocess:"
                         )
                     );
                 }
@@ -1194,6 +1200,29 @@ pub fn open_external_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn open_directory(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        bail!("配置目录不存在: {}", path.display());
+    }
+    let operation = wide_null(std::ffi::OsStr::new("open"));
+    let target = wide_null(path.as_os_str());
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = result.0 as isize;
+    if code <= 32 {
+        bail!("Windows 无法打开配置目录（ShellExecuteW={code}）");
+    }
+    Ok(())
+}
+
 pub fn launch_terminal_client_with_environment(
     title: &str,
     command: &str,
@@ -1239,7 +1268,7 @@ fn launch_terminal_client_with_environment_and_directory(
     // std::process::Command 会把这些句柄继续传给新进程，即使指定 CREATE_NEW_CONSOLE，
     // 交互式 CLI 仍会判断 stdin 不是 TTY。这里直接调用 CreateProcessW，并且不继承句柄。
     // Codex refuses to start its shared Windows daemon from an elevated
-    // terminal. Agent-Switch may itself be elevated, so always use the
+    // terminal. Little Mungbean may itself be elevated, so always use the
     // daemon-free mode for the isolated Codex CLI profile. Claude Code keeps
     // its normal invocation.
     let arguments = if command == "codex" {
@@ -1512,7 +1541,13 @@ pub fn store_codex_installed() -> bool {
 }
 
 pub fn store_claude_installed() -> bool {
-    store_package_installed(&["Claude_pzs8sxrjxfjjc"])
+    store_package_installed(CLAUDE_STORE_PACKAGE_FAMILIES)
+}
+
+pub(crate) fn is_claude_store_package_family(family: &str) -> bool {
+    CLAUDE_STORE_PACKAGE_FAMILIES
+        .iter()
+        .any(|known| family.eq_ignore_ascii_case(known))
 }
 
 fn store_package_installed(package_family_names: &[&str]) -> bool {
@@ -1533,6 +1568,34 @@ fn store_package_installed(package_family_names: &[&str]) -> bool {
         }
         package_count > 0
     })
+}
+
+const CODEX_ROUTE_ENVIRONMENT: &[&str] = &[
+    "OPENAI_BASE_URL",
+    "OPENAI_API_KEY",
+    "CODEX_APP_SERVER_OPENAI_BASE_URL",
+    "CODEX_APP_SERVER_CHATGPT_BASE_URL",
+    "CODEX_REFRESH_TOKEN",
+];
+
+pub fn configure_codex_desktop_environment(
+    command: &mut tokio::process::Command,
+    home: &Path,
+    gateway: Option<(&str, &str)>,
+) {
+    for key in CODEX_ROUTE_ENVIRONMENT {
+        command.env_remove(key);
+    }
+    command.env("CODEX_HOME", home);
+    if let Some((url, token)) = gateway {
+        command
+            .env("OPENAI_BASE_URL", url.trim_end_matches('/'))
+            .env(
+                "CODEX_APP_SERVER_OPENAI_BASE_URL",
+                url.trim_end_matches('/'),
+            )
+            .env("OPENAI_API_KEY", token);
+    }
 }
 
 fn terminal_npm_package(command: &str) -> Option<&'static str> {
@@ -1708,12 +1771,16 @@ fn build_environment_block(overrides: &[(&str, &str)]) -> Result<Vec<u16>> {
         entries.retain(|(name, _)| {
             !matches!(
                 name.to_string_lossy().to_ascii_uppercase().as_str(),
-                "ZNNZ_API_KEY"
+                "LITTLE_MUNGBEAN_API_KEY"
                     | "LITEAPI_API_KEY"
                     | "ANTHROPIC_AUTH_TOKEN"
                     | "OPENAI_API_KEY"
                     | "OPENAI_BASE_URL"
                     | "ANTHROPIC_API_KEY"
+                    | "CLAUDE_CODE_OAUTH_TOKEN"
+                    | "CODEX_APP_SERVER_OPENAI_BASE_URL"
+                    | "CODEX_APP_SERVER_CHATGPT_BASE_URL"
+                    | "CODEX_REFRESH_TOKEN"
             )
         });
     }
@@ -1840,22 +1907,26 @@ pub async fn activate_store_claude() -> Result<u32> {
         .context("Claude Store activation task failed")?
 }
 fn activate_store_claude_blocking() -> Result<u32> {
-    const AUMID: &str = "Claude_pzs8sxrjxfjjc!Claude";
     unsafe {
         let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
         let result = (|| {
             let manager: IApplicationActivationManager =
                 CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)
                     .context("无法创建 Windows 应用激活管理器")?;
-            match manager.ActivateApplication(
-                &HSTRING::from(AUMID),
-                &HSTRING::new(),
-                ACTIVATEOPTIONS(0),
-            ) {
-                Ok(pid) if pid != 0 => Ok(pid),
-                Ok(_) => bail!("Claude Desktop 激活返回 PID 0"),
-                Err(error) => Err(error).context(format!("无法激活 Claude Desktop ({AUMID})")),
+            let mut errors = Vec::new();
+            for family in CLAUDE_STORE_PACKAGE_FAMILIES {
+                let aumid = format!("{family}!Claude");
+                match manager.ActivateApplication(
+                    &HSTRING::from(aumid.as_str()),
+                    &HSTRING::new(),
+                    ACTIVATEOPTIONS(0),
+                ) {
+                    Ok(pid) if pid != 0 => return Ok(pid),
+                    Ok(_) => errors.push(format!("{aumid}: 返回 PID 0")),
+                    Err(error) => errors.push(format!("{aumid}: {error}")),
+                }
             }
+            bail!("无法激活 Claude Desktop: {}", errors.join(", "))
         })();
         if initialized {
             CoUninitialize();
@@ -1865,6 +1936,7 @@ fn activate_store_claude_blocking() -> Result<u32> {
 }
 
 pub async fn activate_store_codex(arguments: &str) -> Result<u32> {
+    // Activation preserves package identity, permissions and the taskbar icon.
     let arguments = arguments.to_owned();
     tokio::task::spawn_blocking(move || activate_store_codex_blocking(&arguments))
         .await
@@ -2003,7 +2075,9 @@ mod tests {
             crate::gui_worker::ClientTarget::ClaudeCode,
         )
         .unwrap();
-        assert!(session.close().is_err());
+        let error = session.close().unwrap_err().to_string();
+        assert!(error.contains("子程序:") || error.contains("Subprocess:"));
+        assert!(error.contains(&child.0.image().unwrap()));
         assert!(session.root.running().unwrap());
         assert!(child.0.running().unwrap());
     }
@@ -2217,7 +2291,7 @@ mod tests {
     #[test]
     fn command_line_query_works_with_query_only_access() {
         let command = process_command_line(std::process::id()).unwrap();
-        assert!(command.to_ascii_lowercase().contains("znnz_agent_launcher"));
+        assert!(command.to_ascii_lowercase().contains("little_mungbean"));
     }
 
     fn entry(pid: u32, parent_pid: u32, name: &str) -> ProcessEntry {
@@ -2234,7 +2308,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "znnz-terminal-candidate-{label}-{}-{nonce}",
+            "little-mungbean-terminal-candidate-{label}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
@@ -2303,7 +2377,7 @@ mod tests {
     #[test]
     fn requested_terminal_working_directory_overrides_user_profile() {
         let unique = format!(
-            "znnz terminal cwd test {} {}",
+            "little-mungbean terminal cwd test {} {}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2352,9 +2426,45 @@ mod tests {
     }
 
     #[test]
+    fn codex_desktop_gateway_and_account_environments_do_not_inherit_foreign_routes() {
+        for gateway in [Some(("http://127.0.0.1:54321/", "local-test-token")), None] {
+            let mut command = tokio::process::Command::new("unused-test-executable");
+            for key in CODEX_ROUTE_ENVIRONMENT {
+                command.env(key, "foreign-test-value");
+            }
+            command.env("USER_SETTING", "preserved");
+            configure_codex_desktop_environment(&mut command, Path::new(r"C:\isolated"), gateway);
+            let values = command
+                .as_std()
+                .get_envs()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.map(|value| value.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(values["USER_SETTING"].as_deref(), Some("preserved"));
+            assert_eq!(values["CODEX_HOME"].as_deref(), Some(r"C:\isolated"));
+            assert_eq!(values["CODEX_APP_SERVER_CHATGPT_BASE_URL"], None);
+            assert_eq!(values["CODEX_REFRESH_TOKEN"], None);
+            for key in ["OPENAI_BASE_URL", "CODEX_APP_SERVER_OPENAI_BASE_URL"] {
+                assert_eq!(
+                    values[key].as_deref(),
+                    gateway.map(|_| "http://127.0.0.1:54321")
+                );
+            }
+            assert_eq!(
+                values["OPENAI_API_KEY"].as_deref(),
+                gateway.map(|(_, token)| token)
+            );
+        }
+    }
+
+    #[test]
     fn batch_command_runs_from_a_directory_with_spaces() {
         let unique = format!(
-            "znnz batch command test {} {}",
+            "little-mungbean batch command test {} {}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2403,12 +2513,45 @@ mod tests {
         assert!(is_official_claude_desktop_path(
             r"C:\Program Files\WindowsApps\Claude_1.24012.9.0_x64__pzs8sxrjxfjjc\app\Claude.exe"
         ));
+        let store_path = r"C:\Program Files\WindowsApps\AnthropicPBC.Claude_3.6556.2.0_x64__fnn82j28hfe8t\app\Claude.exe";
+        assert!(is_official_claude_desktop_path(store_path));
+        assert!(is_official_claude_desktop_path(
+            &store_path.replace('\\', "/").to_ascii_uppercase()
+        ));
+        assert_eq!(
+            classify_client_process("claude", store_path, "Claude.exe"),
+            Some(crate::gui_worker::ClientTarget::ClaudeDesktop)
+        );
         assert!(!is_official_claude_desktop_path(
             r"C:\Users\test\AppData\Roaming\npm\claude.exe"
         ));
         assert!(!is_official_claude_desktop_path(
             r"C:\Program Files\Claude\Claude.exe"
         ));
+        assert!(!is_official_claude_desktop_path(
+            r"C:\Program Files\WindowsApps\AnthropicPBC.ClaudeCode_1_x64\app\Claude.exe"
+        ));
+    }
+
+    #[test]
+    fn claude_store_package_families_include_store_and_direct_download() {
+        assert!(is_claude_store_package_family(
+            "AnthropicPBC.Claude_fnn82j28hfe8t"
+        ));
+        assert!(is_claude_store_package_family("Claude_pzs8sxrjxfjjc"));
+        assert!(is_claude_store_package_family(
+            "anthropicpbc.claude_FNN82J28HFE8T"
+        ));
+        assert!(!is_claude_store_package_family(
+            "AnthropicPBC.Claude_unknown"
+        ));
+        assert!(!is_claude_store_package_family("ClaudeCode_pzs8sxrjxfjjc"));
+    }
+
+    #[test]
+    #[ignore = "requires Claude Desktop installed for the current Windows user; read-only"]
+    fn installed_claude_store_package_is_detected() {
+        assert!(store_claude_installed());
     }
 
     #[test]
@@ -2425,7 +2568,7 @@ mod tests {
         assert!(!is_codex_companion_name("Codex.exe"));
 
         assert!(is_codex_related("codex-plus-plus-manager.exe"));
-        assert!(!is_codex_related("znnz-client.exe"));
+        assert!(!is_codex_related("little-mungbean-client.exe"));
     }
 
     #[test]
@@ -2440,7 +2583,7 @@ mod tests {
             entry(21, 20, "Codex.exe"),
             entry(30, 1, "Codex++.exe"),
             entry(31, 30, "ChatGPT.exe"),
-            entry(40, 10, "znnz-client.exe"),
+            entry(40, 10, "little-mungbean-client.exe"),
         ];
 
         let tree = codex_desktop_process_tree_from_entries(&entries, &[13, 12]);

@@ -211,6 +211,7 @@ impl DesktopModelMenu {
         menu
     }
 
+    #[cfg(test)]
     pub fn model_count(&self) -> usize {
         match self.mode {
             ClaudeDesktopModelMode::FourSlots => 4,
@@ -228,6 +229,7 @@ impl DesktopModelMenu {
         }
     }
 
+    #[cfg(test)]
     pub fn aliased_model_count(&self) -> usize {
         self.models
             .iter()
@@ -235,6 +237,7 @@ impl DesktopModelMenu {
             .count()
     }
 
+    #[cfg(test)]
     pub fn default_model_name(&self) -> Option<&str> {
         self.models
             .first()
@@ -533,7 +536,7 @@ struct ProxyState {
     slots: ModelSlots,
     model_routes: HashMap<String, String>,
     models_response: Value,
-    client: Client,
+    client: network_proxy::Client,
     request_sequence: AtomicU64,
 }
 
@@ -561,14 +564,16 @@ impl ClaudeDesktopProxy {
         if !address.ip().is_loopback() {
             bail!("安全检查失败：Claude Desktop 代理没有绑定到回环地址");
         }
-        let client = network_proxy::builder_for_url(Client::builder(), gateway_url)?
-            .connect_timeout(Duration::from_secs(12))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent(format!(
-                "znnz-client/{} claude-desktop-proxy",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .build()?;
+        let client = network_proxy::Client::new(|| {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(12))
+                .pool_idle_timeout(Duration::from_secs(30))
+                .user_agent(format!(
+                    "little-mungbean-client/{} claude-desktop-proxy",
+                    env!("CARGO_PKG_VERSION")
+                ))
+        })?
+        .redirect_limit(0);
         let state = Arc::new(ProxyState {
             gateway,
             upstream_key: Secret::new(api_key),
@@ -677,6 +682,13 @@ async fn handle_request(request: Request<Incoming>, state: Arc<ProxyState>) -> R
         );
     }
     if !authorized(request.headers(), state.local_token.expose()) {
+        warn!(
+            "{}",
+            i18n::tr(
+                "Claude 本地模型代理拒绝了凭据不匹配的请求；请求未进入主网关，请从 Little Mungbean 重新启动客户端。",
+                "The Claude local model proxy rejected mismatched credentials before reaching the main gateway; restart the client from Little Mungbean."
+            )
+        );
         return cors_response(json_error(StatusCode::UNAUTHORIZED, "unauthorized"), None);
     }
 

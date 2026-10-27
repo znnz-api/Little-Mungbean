@@ -59,7 +59,7 @@ impl Tray {
                 .icon
                 .szTip
                 .iter_mut()
-                .zip("Agent-Switch".encode_utf16())
+                .zip("Little-Mungbean".encode_utf16())
             {
                 *slot = value;
             }
@@ -192,12 +192,12 @@ mod tests {
 
     #[test]
     fn tray_restores_hidden_window_and_exit_only_requests_confirmation() {
-        // Own off-screen fixture, never the real Agent-Switch/Codex window.
+        // Own off-screen fixture, never the real Little-Mungbean/Codex window.
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                w!("Agent-Switch tray fixture"),
+                w!("Little-Mungbean tray fixture"),
                 WS_POPUP,
                 -30000,
                 -30000,

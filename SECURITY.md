@@ -4,7 +4,7 @@ Please report security issues via email at heimen115@gmail.com; do not submit AP
 
 Include the affected version, reproduction steps, and sanitized error information.
 
-The launcher encrypts remembered API Keys with Windows DPAPI and does not pass Keys through command-line arguments. The Claude Desktop local proxy listens only on the loopback address. Windows installers are signature-checked before execution.
+The launcher encrypts remembered API Keys with Windows DPAPI on Windows or Keychain-backed authenticated encryption on macOS and does not pass Keys through command-line arguments. The Claude Desktop local proxy listens only on the loopback address. Windows installers are signature-checked before execution.
 
 ## 中文说明
 
@@ -12,4 +12,4 @@ The launcher encrypts remembered API Keys with Windows DPAPI and does not pass K
 
 报告请包含受影响版本、复现步骤和已脱敏的错误信息。
 
-启动器使用 Windows DPAPI 加密记住的 API Key，不通过命令行传递 Key；Claude Desktop 的本地代理只监听回环地址。下载的 Windows 安装包在运行前进行签名校验。
+启动器在 Windows 使用 DPAPI、在 macOS 使用 Keychain 密钥支持的认证加密保存 API Key，不通过命令行传递 Key；Claude Desktop 的本地代理只监听回环地址。下载的 Windows 安装包在运行前进行签名校验。

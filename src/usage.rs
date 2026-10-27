@@ -1,5 +1,5 @@
 //! Local usage metadata only. Never persist prompts, completions or API keys.
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -8,18 +8,14 @@ use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn database_path() -> Result<PathBuf> {
-    Ok(
-        PathBuf::from(std::env::var_os("LOCALAPPDATA").context("无法确定统计目录")?)
-            .join("Agent-Switch")
-            .join("usage.sqlite3"),
-    )
+    Ok(crate::platform_paths::data_root()?.join("usage.sqlite3"))
 }
 
 /// Stable per URL + Key identifier. The plaintext key is never written to the database.
 pub fn configuration_id(gateway_url: &str, api_key: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
-    digest.update(b"Agent-Switch-usage-v1\0");
+    digest.update(b"Little-Mungbean-usage-v1\0");
     let normalized = url::Url::parse(gateway_url.trim())
         .map(|mut url| {
             url.set_query(None);
@@ -248,12 +244,22 @@ pub fn load_summaries(path: &Path) -> Result<HashMap<String, Summary>> {
 }
 
 fn read_summaries(connection: &Connection) -> Result<HashMap<String, Summary>> {
+    // A client can close a successful 2xx stream immediately after receiving
+    // the usable answer. Older records from that path were stored as failed
+    // even though they contain output tokens. Treat those records as success
+    // in read views as well, so provider statistics and existing logs repair
+    // themselves without rewriting the user's database.
+    const RECOVERABLE_SUCCESS: &str = "(outcome IN ('failed','cancelled') AND status_code BETWEEN 200 AND 299 AND output_tokens > 0)";
     let mut query = connection.prepare(
-        "SELECT configuration_id,COUNT(*),SUM(outcome='success'),SUM(outcome IN ('failed','cancelled')),
+        &format!(
+            "SELECT configuration_id,COUNT(*),
+             SUM(CASE WHEN outcome='success' OR {RECOVERABLE_SUCCESS} THEN 1 ELSE 0 END),
+             SUM(CASE WHEN outcome IN ('failed','cancelled') AND NOT COALESCE({RECOVERABLE_SUCCESS}, 0) THEN 1 ELSE 0 END),
          SUM(input_tokens),SUM(output_tokens),SUM(cache_read),SUM(cache_write),
          SUM(CASE WHEN cache_input IS NOT NULL THEN cache_read END),SUM(cache_input),
          COUNT(input_tokens),COUNT(output_tokens),COUNT(cache_read),COUNT(cache_write)
-         FROM requests GROUP BY configuration_id",
+         FROM requests GROUP BY configuration_id"
+        ),
     )?;
     let rows = query.query_map([], |row| {
         Ok((
@@ -316,8 +322,11 @@ pub struct ModelLogEntry {
 }
 
 fn read_model_logs(connection: &Connection, limit: usize) -> Result<Vec<ModelLogEntry>> {
-    let mut query = connection.prepare(
-        "SELECT started_ms,configuration_id,client,model,outcome,status_code,request_kind,
+    const RECOVERABLE_SUCCESS: &str = "(outcome IN ('failed','cancelled') AND status_code BETWEEN 200 AND 299 AND output_tokens > 0)";
+    let mut query = connection.prepare(&format!(
+        "SELECT started_ms,configuration_id,client,model,
+                CASE WHEN {RECOVERABLE_SUCCESS} THEN 'success' ELSE outcome END,
+                status_code,request_kind,
                 input_tokens,cache_read,cache_write,output_tokens,total_ms,first_byte_ms,
                 endpoint,conversion,streaming
          FROM requests
@@ -325,8 +334,8 @@ fn read_model_logs(connection: &Connection, limit: usize) -> Result<Vec<ModelLog
            AND request_kind <> 'probe'
            AND NOT (client = 'Codex Desktop' AND model IS NULL
                     AND endpoint = '/responses' AND status_code IN (404,405))
-         ORDER BY started_ms DESC LIMIT ?1",
-    )?;
+         ORDER BY started_ms DESC LIMIT ?1"
+    ))?;
     let rows = query.query_map([limit as i64], |row| {
         Ok(ModelLogEntry {
             started_ms: row.get(0)?,
@@ -710,9 +719,23 @@ impl UsageParser {
     }
     pub fn finish(&mut self) -> bool {
         if self.sse {
-            // Require a dispatched completion marker, not simply a clean TCP EOF.
-            if !self.buffer.is_empty() || !self.event.is_empty() {
+            // Some upstreams omit the final blank line when closing an SSE
+            // response. Flush the buffered final data event before deciding
+            // that the stream is incomplete; a clean EOF alone still does not
+            // count as success because `terminal` must be set by the protocol.
+            if self.dropping_line || self.dropping_event {
                 self.error = true;
+            } else {
+                if !self.buffer.is_empty() {
+                    let mut line = std::mem::take(&mut self.buffer);
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    self.line(&line);
+                }
+                if !self.event.is_empty() {
+                    self.line(&[]);
+                }
             }
         } else if !self.dropping_line {
             match serde_json::from_slice::<Value>(&self.buffer) {
@@ -741,6 +764,14 @@ impl UsageParser {
             .filter(|(input, read)| read <= input)
             .map(|(input, _)| input);
     }
+
+    /// Some otherwise successful upstreams close a 2xx stream without a
+    /// protocol-specific completion event. Positive output usage is a useful
+    /// fallback signal in that case, but explicit parser errors must still
+    /// prevent success classification.
+    fn has_usable_output(&self) -> bool {
+        !self.error && self.usage.output.is_some_and(|value| value > 0)
+    }
 }
 
 pub struct RequestUsage {
@@ -768,17 +799,13 @@ impl RequestUsage {
     pub fn finish(&mut self, complete: bool) {
         if let Some(id) = self.id.take() {
             let valid = self.parser.finish();
-            let outcome = if complete && self.http_success && valid {
-                "success"
-            } else if !complete
-                && self
-                    .status_code
-                    .is_some_and(|code| (200..300).contains(&code))
-            {
-                "cancelled"
-            } else {
-                "failed"
-            };
+            let outcome = classify_request_outcome(
+                complete,
+                self.http_success,
+                self.status_code,
+                valid,
+                self.parser.has_usable_output(),
+            );
             let _ = self.recorder.0.send(Event::Finish {
                 id,
                 outcome: outcome.to_owned(),
@@ -792,6 +819,25 @@ impl RequestUsage {
                 usage: self.parser.usage,
             });
         }
+    }
+}
+
+fn classify_request_outcome(
+    complete: bool,
+    http_success: bool,
+    status_code: Option<u16>,
+    parser_valid: bool,
+    usable_output: bool,
+) -> &'static str {
+    // The downstream client may close a successful stream after it has
+    // received enough output to render the answer. Do not call that failure
+    // when the HTTP response is successful and the parser saw usable output.
+    if http_success && (parser_valid || usable_output) {
+        "success"
+    } else if !complete && status_code.is_some_and(|code| (200..300).contains(&code)) {
+        "cancelled"
+    } else {
+        "failed"
     }
 }
 
@@ -919,6 +965,18 @@ mod tests {
         parser.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":2}}}\n\n");
         assert!(parser.finish());
         assert_eq!(parser.usage.input, Some(8));
+        let mut response_without_final_blank_line = UsageParser::new(Protocol::Responses);
+        response_without_final_blank_line.set_content_type("text/event-stream");
+        response_without_final_blank_line.feed(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":2}}}",
+        );
+        assert!(response_without_final_blank_line.finish());
+        let mut response_with_usage_but_no_completion = UsageParser::new(Protocol::Responses);
+        response_with_usage_but_no_completion.set_content_type("text/event-stream");
+        response_with_usage_but_no_completion
+            .feed(b"data: {\"usage\":{\"input_tokens\":8,\"output_tokens\":2}}\n\n");
+        assert!(!response_with_usage_but_no_completion.finish());
+        assert!(response_with_usage_but_no_completion.has_usable_output());
         let mut chat = UsageParser::new(Protocol::Chat);
         chat.set_content_type("text/event-stream");
         chat.feed(b"data: {\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2}}\n\n");
@@ -1059,6 +1117,54 @@ mod tests {
     }
 
     #[test]
+    fn successful_200_with_output_is_not_reported_as_failed() {
+        let connection = connect(std::path::Path::new(":memory:")).unwrap();
+        let configuration = configuration_id("https://example.test", "key");
+        write_event(
+            &connection,
+            Event::Start {
+                id: "completed-after-client-close".into(),
+                configuration: configuration.clone(),
+                metadata: RequestMetadata {
+                    client: "Codex Desktop".into(),
+                    model: Some("gpt-6.1-sol".into()),
+                    endpoint: "/responses".into(),
+                    streaming: true,
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        write_event(
+            &connection,
+            Event::Finish {
+                id: "completed-after-client-close".into(),
+                outcome: "failed".into(),
+                status_code: Some(200),
+                total_ms: Some(1_000),
+                first_byte_ms: Some(200),
+                usage: Usage {
+                    input: Some(100),
+                    output: Some(3),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+
+        let summaries = read_summaries(&connection).unwrap();
+        assert_eq!(
+            (
+                summaries[&configuration].success,
+                summaries[&configuration].failed
+            ),
+            (1, 0)
+        );
+        let logs = read_model_logs(&connection, 10).unwrap();
+        assert_eq!(logs[0].outcome, "success");
+    }
+
+    #[test]
     fn model_logs_hide_codex_probe_405_without_hiding_real_failures() {
         let connection = connect(std::path::Path::new(":memory:")).unwrap();
         let configuration = configuration_id("https://example.test", "key");
@@ -1161,7 +1267,7 @@ mod tests {
     #[test]
     fn dropped_request_records_failure_and_database_survives_reopen() {
         let path = std::env::temp_dir().join(format!(
-            "agent-switch-usage-{:032x}.sqlite",
+            "little-mungbean-usage-{:032x}.sqlite",
             rand::random::<u128>()
         ));
         let recorder = Recorder::open(&path).unwrap();

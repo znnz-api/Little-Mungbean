@@ -118,10 +118,25 @@ pub fn injectable_targets(targets: &[CdpTarget], port: u16) -> Vec<CdpTarget> {
         .collect()
 }
 
-pub async fn inject_target(
+pub async fn inject_target_catalog(
     target: &CdpTarget,
     port: u16,
     injection: &crate::injection::ScriptBundle,
+) -> Result<()> {
+    inject_target_with_health(
+        target,
+        port,
+        injection,
+        injection.catalog_health_expression(),
+    )
+    .await
+}
+
+async fn inject_target_with_health(
+    target: &CdpTarget,
+    port: u16,
+    injection: &crate::injection::ScriptBundle,
+    health_expression: &str,
 ) -> Result<()> {
     let websocket_url = target
         .websocket_url
@@ -162,7 +177,7 @@ pub async fn inject_target(
             3 + attempt,
             "Runtime.evaluate",
             json!({
-                "expression": injection.health_expression(),
+                "expression": health_expression,
                 "awaitPromise": true,
                 "returnByValue": true,
                 "allowUnsafeEvalBlockedByCSP": true
@@ -195,7 +210,7 @@ pub async fn inject_target(
         .and_then(|response| response.pointer("/result/result/value").cloned())
         .unwrap_or_else(|| json!({ "installed": false, "diagnostic": "无法读取健康详情" }));
         bail!(
-            "注入脚本已执行，但模型目录在 5 秒内未通过健康检查。健康状态: {}",
+            "注入脚本已执行，但目录或 Codex 请求客户端状态在 5 秒内未通过健康检查。健康状态: {}",
             serde_json::to_string(&details).unwrap_or_else(|_| "<无法序列化>".to_owned())
         )
     }
@@ -203,7 +218,7 @@ pub async fn inject_target(
     Ok(())
 }
 
-pub async fn inject_all(
+pub async fn inject_all_catalog(
     port: u16,
     injection: &crate::injection::ScriptBundle,
 ) -> Result<HashSet<String>> {
@@ -214,7 +229,7 @@ pub async fn inject_all(
     let mut injected = HashSet::new();
     let mut errors = Vec::new();
     for target in targets {
-        match inject_target(&target, port, injection).await {
+        match inject_target_catalog(&target, port, injection).await {
             Ok(()) => {
                 injected.insert(target.id);
             }
@@ -242,6 +257,22 @@ pub async fn target_health(
     port: u16,
     injection: &crate::injection::ScriptBundle,
 ) -> Result<bool> {
+    target_health_with_expression(target, port, injection.health_expression()).await
+}
+
+pub async fn target_catalog_health(
+    target: &CdpTarget,
+    port: u16,
+    injection: &crate::injection::ScriptBundle,
+) -> Result<bool> {
+    target_health_with_expression(target, port, injection.catalog_health_expression()).await
+}
+
+async fn target_health_with_expression(
+    target: &CdpTarget,
+    port: u16,
+    health_expression: &str,
+) -> Result<bool> {
     let websocket_url = target
         .websocket_url
         .as_deref()
@@ -256,7 +287,7 @@ pub async fn target_health(
         10,
         "Runtime.evaluate",
         json!({
-            "expression": injection.health_expression(),
+            "expression": health_expression,
             "awaitPromise": true,
             "returnByValue": true,
             "allowUnsafeEvalBlockedByCSP": true

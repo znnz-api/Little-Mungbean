@@ -8,7 +8,7 @@ const catalog = (hidden) => ({
   models: ['gpt-old', 'gpt-new'].map((slug) => ({
     slug, supported_in_api: true, visibility: hidden.includes(slug) ? 'hide' : 'list',
   })),
-  agent_switch_hidden_models: hidden,
+  little_mungbean_hidden_models: hidden,
 });
 
 async function main() {
@@ -16,10 +16,10 @@ async function main() {
     console, location: { href: 'https://synthetic.test' },
     setTimeout() {}, setInterval() {},
     window: { dispatchEvent() {}, addEventListener() {} },
-    __ZNNZ_CLIENT_CONFIG__: { catalog: catalog(['gpt-old']), version: 'test' },
+    __LITTLE_MUNGBEAN_CLIENT_CONFIG__: { catalog: catalog(['gpt-old']), version: 'test' },
   });
   vm.runInContext(source, context);
-  const unlock = context.__ZNNZ_MODEL_UNLOCK__;
+  const unlock = context.__LITTLE_MUNGBEAN_MODEL_UNLOCK__;
   await unlock.refresh();
   const response = {
     models: [{ model: 'gpt-old' }, { model: 'native-other' }],

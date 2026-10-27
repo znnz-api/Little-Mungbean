@@ -22,7 +22,7 @@ async function main() {
     listeners.set(type, values);
   };
   context.dispatchEvent = () => true;
-  context.__ZNNZ_CLIENT_CONFIG__ = {
+  context.__LITTLE_MUNGBEAN_CLIENT_CONFIG__ = {
     version: "test",
     defaultModel: "gpt-5.6-sol",
     modelDescription: "From https://api.znnz.net",
@@ -48,9 +48,19 @@ async function main() {
   await Promise.resolve();
   await Promise.resolve();
 
-  const api = context.__ZNNZ_MODEL_UNLOCK__;
+  const api = context.__LITTLE_MUNGBEAN_MODEL_UNLOCK__;
   assert.equal(api.health().modelCount, 2);
   assert.equal(api.health().catalogSource, "inline");
+  assert.equal(api.health().requestClientReady, false);
+  assert.deepEqual(
+    Array.from(api._test.reasoningEfforts({
+      supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }],
+    }, "openai/gpt-6-astra"), (item) => item.reasoningEffort),
+    ["low", "medium", "high", "xhigh", "max", "ultra"],
+  );
+  assert.equal(api._test.patchRequestClient({ sendRequest: async () => ({}) }), true);
+  assert.equal(api.health().requestClientReady, true);
+  assert.equal(api.health().patchedClientCount, 1);
 
   const recentTasks = ["task-one", "task-two"];
   const taskPayload = { recent: recentTasks, data: ["task-three"] };

@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  const incoming = globalThis.__ZNNZ_CLIENT_CONFIG__ || {};
-  const existingUnlock = globalThis.__ZNNZ_MODEL_UNLOCK__;
+  const incoming = globalThis.__LITTLE_MUNGBEAN_CLIENT_CONFIG__ || {};
+  const existingUnlock = globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__;
   if (existingUnlock && existingUnlock.version === incoming.version) {
     existingUnlock.configure(incoming);
     return;
@@ -33,7 +33,7 @@
     const item = { where, message: String(error?.message || error), at: Date.now() };
     state.failures.push(item);
     if (state.failures.length > 30) state.failures.shift();
-    console.warn("[znnz-client]", where, item.message);
+    console.warn("[little-mungbean-client]", where, item.message);
   };
 
   const unique = (items) => [...new Set(items
@@ -49,7 +49,7 @@
     state.catalog = { ...payload, models };
     state.metadata = metadata;
     state.names = unique(models.map((model) => model.slug));
-    state.hiddenNames = new Set(unique(payload?.agent_switch_hidden_models || []));
+    state.hiddenNames = new Set(unique(payload?.little_mungbean_hidden_models || []));
     state.loadedAt = Date.now();
     return state.catalog;
   };
@@ -199,11 +199,11 @@
   };
 
   const installPickerInteractionPatch = () => {
-    if (window.__ZNNZ_PICKER_INTERACTION_PATCHED__) {
+    if (window.__LITTLE_MUNGBEAN_PICKER_INTERACTION_PATCHED__) {
       state.pickerInteractionHookInstalled = true;
       return;
     }
-    window.__ZNNZ_PICKER_INTERACTION_PATCHED__ = true;
+    window.__LITTLE_MUNGBEAN_PICKER_INTERACTION_PATCHED__ = true;
     state.pickerInteractionHookInstalled = true;
     const handlePointer = (event) => {
       if (isModelPickerInteraction(event?.target)) schedulePickerLabelRefresh();
@@ -218,13 +218,19 @@
   };
 
 
-  const reasoningEfforts = (model) => {
+  const isExpandedReasoningModel = (name) => {
+    const slug = String(name || "").split("/").pop().toLowerCase();
+    return /^(gpt-5|gpt-6|claude-|anthropic-)/.test(slug);
+  };
+
+  const reasoningEfforts = (model, name) => {
     const raw = model.supported_reasoning_levels
       || model.supportedReasoningLevels
       || model.supported_reasoning_efforts
       || model.supportedReasoningEfforts;
+    let values;
     if (Array.isArray(raw) && raw.length) {
-      return raw.map((item) => {
+      values = raw.map((item) => {
         const effort = typeof item === "string"
           ? item
           : item.reasoning_effort || item.reasoningEffort || item.effort || "medium";
@@ -235,17 +241,26 @@
             : `${effort} effort`,
         };
       });
+    } else {
+      values = ["low", "medium", "high"].map((reasoningEffort) => ({
+        reasoningEffort,
+        description: `${reasoningEffort} effort`,
+      }));
     }
-    return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({
-      reasoningEffort,
-      description: `${reasoningEffort} effort`,
-    }));
+    if (!isExpandedReasoningModel(name)) return values;
+    const byEffort = new Map(values.map((item) => [item.reasoningEffort.toLowerCase(), item]));
+    return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) =>
+      byEffort.get(reasoningEffort) || {
+        reasoningEffort,
+        description: `${reasoningEffort} effort`,
+      });
   };
 
   const descriptor = (name, template = null) => {
     const model = modelMetadata(name);
     const defaultEffort = model.default_reasoning_level || model.defaultReasoningLevel || "medium";
     const description = state.config.modelDescription || model.description || "From gateway";
+    const efforts = reasoningEfforts(model, name);
     return {
       ...(template && typeof template === "object" ? template : {}),
       model: name,
@@ -261,9 +276,10 @@
       // Keep all spellings used by current and older Codex Desktop builds.
       // Some builds read the camelCase field, while newer builds read the
       // snake_case capability field and otherwise fall back to three levels.
-      supportedReasoningEfforts: reasoningEfforts(model),
-      supported_reasoning_levels: reasoningEfforts(model),
-      supported_reasoning_efforts: reasoningEfforts(model),
+      supportedReasoningLevels: efforts.map((item) => ({ ...item })),
+      supportedReasoningEfforts: efforts.map((item) => ({ ...item })),
+      supported_reasoning_levels: efforts.map((item) => ({ ...item })),
+      supported_reasoning_efforts: efforts.map((item) => ({ ...item })),
       visibility: "list",
       supportedInApi: true,
       supported_in_api: true,
@@ -449,11 +465,11 @@
   };
 
   const installMessagePatch = () => {
-    if (window.__ZNNZ_MESSAGE_PATCHED__) {
+    if (window.__LITTLE_MUNGBEAN_MESSAGE_PATCHED__) {
       state.messageHookInstalled = true;
       return;
     }
-    window.__ZNNZ_MESSAGE_PATCHED__ = true;
+    window.__LITTLE_MUNGBEAN_MESSAGE_PATCHED__ = true;
     state.messageHookInstalled = true;
     const originalDispatch = window.dispatchEvent;
     window.dispatchEvent = function (event) {
@@ -510,7 +526,7 @@
       try {
         let runtime;
         const chunk = globalThis[key];
-        const marker = `znnz_${Date.now()}_${Math.random()}`;
+        const marker = `little_mungbean_${Date.now()}_${Math.random()}`;
         chunk.push([[marker], {}, (require) => { runtime = require; }]);
         chunk.pop();
         const cache = runtime?.c;
@@ -544,18 +560,21 @@
     }).catch((error) => logFailure("catalog", error));
   };
 
-  globalThis.__ZNNZ_MODEL_UNLOCK__ = {
+  globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__ = {
     version: incoming.version || "unknown",
     configure,
     refresh: () => loadCatalog(true).then(refreshPass),
     health: () => ({
       installed: true,
+      catalogReady: state.loadedAt > 0
+        && (state.names.length > 0 || Boolean(state.config.allowEmptyModelList)),
       modelCount: state.names.length,
       loadedAt: state.loadedAt,
       catalogSource: state.catalogSource,
       messageHookInstalled: state.messageHookInstalled,
       pickerInteractionHookInstalled: state.pickerInteractionHookInstalled,
       patchedClientCount: state.patchedClientCount,
+      requestClientReady: state.patchedClientCount > 0,
       patchedStatsigClientCount: state.patchedStatsigClientCount,
       patchedModelResponses: state.patchedModelResponses,
       patchedLabelCount: state.patchedLabelCount,
@@ -565,8 +584,10 @@
     _test: {
       patchModelListResult,
       patchMcpData,
+      patchRequestClient,
       trackMcpRequestId: (id) => state.mcpRequestIds.add(String(id)),
       patchStatsigModelConfig,
+      reasoningEfforts,
       modelNameForLabel,
       patchModelPickerLabels,
       isModelPickerInteraction,

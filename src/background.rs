@@ -22,6 +22,8 @@ struct Shared {
 }
 
 struct ClientControl {
+    model_list_mode: ModelListMode,
+    ready: Arc<std::sync::atomic::AtomicBool>,
     cancel: tokio::sync::watch::Sender<bool>,
     finished: tokio::sync::watch::Receiver<bool>,
 }
@@ -105,6 +107,29 @@ pub fn is_managed() -> bool {
     SHARED.get().is_some()
 }
 
+pub fn client_model_list_mode(target: ClientTarget) -> Option<ModelListMode> {
+    let shared = SHARED.get()?;
+    let clients = shared
+        .clients
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    clients.get(&target).map(|client| client.model_list_mode)
+}
+
+pub fn confirm_client_ready(target: ClientTarget) {
+    if let Some(shared) = SHARED.get()
+        && let Some(client) = shared
+            .clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&target)
+    {
+        client
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 pub fn log_path() -> Option<PathBuf> {
     LOG.with(|log| log.borrow().clone())
 }
@@ -129,21 +154,48 @@ pub fn retain_proxy(target: ClientTarget, proxy: crate::claude_desktop_proxy::Cl
     }
 }
 
-pub fn remember_terminal(target: ClientTarget, pid: u32) -> Result<()> {
+pub async fn remember_terminal(target: ClientTarget, pid: u32) -> Result<()> {
     if let Some(shared) = SHARED.get() {
-        let mut last_error = None;
-        let session = (0..12)
-            .find_map(
-                |_| match crate::platform::TerminalRestartSession::record(pid, target) {
-                    Ok(session) => Some(session),
+        #[cfg(target_os = "macos")]
+        let session = {
+            // Native CLI startup can outlast the old 600 ms registration window.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match crate::platform::TerminalRestartSession::record(pid, target) {
+                    Ok(session) => break session,
                     Err(error) => {
-                        last_error = Some(error);
-                        std::thread::sleep(Duration::from_millis(50));
-                        None
+                        if tokio::time::Instant::now() >= deadline
+                            || crate::platform::running_any_process_ids(&[pid])?.is_empty()
+                        {
+                            return Err(error).context(crate::i18n::tr(
+                                "启动后无法确认自有终端客户端",
+                                "Could not verify the owned terminal client after launch",
+                            ));
+                        }
                     }
-                },
-            )
-            .ok_or_else(|| last_error.unwrap_or_else(|| anyhow::anyhow!("终端会话尚未准备好")))?;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let session = {
+            // Preserve the existing Windows registration behavior.
+            let mut last_error = None;
+            (0..12)
+                .find_map(
+                    |_| match crate::platform::TerminalRestartSession::record(pid, target) {
+                        Ok(session) => Some(session),
+                        Err(error) => {
+                            last_error = Some(error);
+                            std::thread::sleep(Duration::from_millis(50));
+                            None
+                        }
+                    },
+                )
+                .ok_or_else(|| {
+                    last_error.unwrap_or_else(|| anyhow::anyhow!("终端会话尚未准备好"))
+                })?
+        };
         shared
             .terminals
             .lock()
@@ -158,21 +210,67 @@ async fn prepare_client_reconnect(
     gateway_url: &str,
     key: &str,
     mode: ModelListMode,
-) -> Result<()> {
-    // Validate the replacement catalog before closing any client or changing its route.
-    let catalog = crate::catalog::fetch_catalog(gateway_url, key, "0.145.0").await?;
-    if mode == ModelListMode::Gateway {
-        let hidden = crate::gui_settings::hidden_models_for_configuration(gateway_url, key)?;
-        crate::catalog::validate_model_menu_catalog(&crate::catalog::model_menu_catalog(
-            &catalog, &hidden,
-        ))?;
+) -> Result<(Option<crate::platform::NamedMutexGuard>, serde_json::Value)> {
+    #[cfg(target_os = "macos")]
+    if target == ClientTarget::ClaudeDesktop {
+        crate::claude_desktop_registry::preflight()?;
     }
-    release_client(target).await
+    // Validate the replacement catalog before closing any client or changing its route.
+    let catalog =
+        crate::gui_worker::fetch_catalog_for_target(target, gateway_url, key, mode).await?;
+    #[cfg(target_os = "macos")]
+    {
+        // End our old monitor before reserving its replacement lock. A conflict
+        // with another process must fail before we request the Desktop to quit.
+        let shared = SHARED.get().context("后台网关尚未启动")?;
+        let previous = shared
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&target)
+            .cloned();
+        if let Some(previous) = previous {
+            previous.cancel_and_wait().await?;
+        }
+        let mutex = crate::runtime_state::acquire_worker_mutex(target)?;
+        release_client(target).await?;
+        Ok((Some(mutex), catalog))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        release_client(target).await?;
+        Ok((None, catalog))
+    }
 }
 
 async fn release_client(target: ClientTarget) -> Result<()> {
     let shared = SHARED.get().context("后台网关尚未启动")?;
     async {
+        #[cfg(target_os = "macos")]
+        if matches!(target, ClientTarget::CodexCli | ClientTarget::ClaudeCode) {
+            let needs_recovery = !shared
+                .terminals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&target);
+            if needs_recovery
+                && let Some(session) = crate::platform::TerminalRestartSession::recover(target)?
+            {
+                shared
+                    .terminals
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(target, Arc::new(session));
+                println!(
+                    "{} • {}",
+                    target.title(),
+                    crate::i18n::tr(
+                        "已恢复之前启动的终端会话管理",
+                        "Recovered the previously launched terminal session"
+                    )
+                );
+            }
+        }
         let previous = shared
             .clients
             .lock()
@@ -195,8 +293,8 @@ async fn release_client(target: ClientTarget) -> Result<()> {
                         .get(&target)
                         .cloned()
                         .context(crate::i18n::tr(
-                            "当前终端不是 Agent-Switch 管理的会话",
-                            "The terminal is not an Agent-Switch managed session",
+                            "当前终端不是 Little Mungbean 管理的会话",
+                            "The terminal is not a Little Mungbean managed session",
                         ))?;
                     terminal.verify_client_sessions()?;
                     terminal.close()?;
@@ -212,6 +310,19 @@ async fn release_client(target: ClientTarget) -> Result<()> {
                             )
                         );
                     }
+                }
+            }
+        } else {
+            #[cfg(target_os = "macos")]
+            if matches!(target, ClientTarget::CodexCli | ClientTarget::ClaudeCode) {
+                let terminal = shared
+                    .terminals
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&target)
+                    .cloned();
+                if let Some(terminal) = terminal {
+                    terminal.close_finished_if_exited()?;
                 }
             }
         }
@@ -265,6 +376,18 @@ pub fn start_account_mode_job(target: ClientTarget, log_path: PathBuf) -> Result
                     // otherwise an old injection job could write the gateway back.
                     release_client(target).await?;
                     crate::account_mode::restore(target)?;
+                    #[cfg(target_os = "macos")]
+                    if target == ClientTarget::CodexCli {
+                        // The detached daemon can outlive the terminal. Reload the
+                        // restored account route even when no terminal needs reopening.
+                        let paths = crate::account_mode::paths(target)?;
+                        if crate::platform::refresh_codex_cli_app_server(&paths.codex_home, &[]).await? {
+                            println!("{}", crate::i18n::tr(
+                                "已刷新 Codex CLI 后台服务，将使用账号模式配置",
+                                "Refreshed the Codex CLI background service to use the account-mode configuration"
+                            ));
+                        }
+                    }
                     crate::local_gateway::disconnect_for_account(target)?;
                     println!("{} • {}", target.title(), crate::i18n::tr("已恢复账号模式", "Account mode restored"));
                     if was_running {
@@ -274,16 +397,19 @@ pub fn start_account_mode_job(target: ClientTarget, log_path: PathBuf) -> Result
                     Ok::<_, anyhow::Error>(())
                 } => result,
             }
-        }).map_err(|error| crate::i18n::runtime_error(&error));
+        }).map_err(|error| crate::i18n::runtime_log_error(&error));
         if let Err(error) = &result {
-            print_line(format_args!("\n{}:\n  {error}", crate::i18n::tr("错误", "Error")));
+            print_line(format_args!("{}", crate::i18n::runtime_error_block(error)));
         }
         let _ = sender.send(result);
     })?;
     let mut threads = shared.threads.lock().unwrap_or_else(|e| e.into_inner());
     threads.retain(|thread| !thread.is_finished());
     threads.push(thread);
-    Ok(Job(receiver))
+    Ok(Job(
+        receiver,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    ))
 }
 
 #[cfg(test)]
@@ -291,8 +417,15 @@ pub fn test_runtime() -> tokio::runtime::Handle {
     SHARED.get().unwrap().runtime.clone()
 }
 
-pub struct Job(mpsc::Receiver<std::result::Result<(), String>>);
+pub struct Job(
+    mpsc::Receiver<std::result::Result<(), String>>,
+    Arc<std::sync::atomic::AtomicBool>,
+);
 impl Job {
+    pub fn is_ready(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn poll(&self) -> Option<std::result::Result<(), String>> {
         match self.0.try_recv() {
             Ok(result) => Some(result),
@@ -354,7 +487,13 @@ pub fn start_client_job(
     let mut shutdown = shared.shutdown.subscribe();
     let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
     let (completed, finished) = tokio::sync::watch::channel(false);
-    let control = Arc::new(ClientControl { cancel, finished });
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control = Arc::new(ClientControl {
+        model_list_mode: mode,
+        ready: ready.clone(),
+        cancel,
+        finished,
+    });
     let (sender, receiver) = mpsc::channel();
     let thread =
         std::thread::Builder::new()
@@ -376,7 +515,7 @@ pub fn start_client_job(
                     });
                 LOG.with(|log| *log.borrow_mut() = Some(log_path));
                 // Keep thread-affine Windows mutexes on this thread; all async I/O runs on
-                // the shared host runtime. No additional Agent-Switch process is started.
+                // the shared host runtime. No additional Little-Mungbean process is started.
                 let mut registered = false;
                 let result = runtime.block_on(async {
             tokio::select! {
@@ -386,7 +525,7 @@ pub fn start_client_job(
                     if update_only {
                         crate::gui_worker::update_gateway(target, &gateway_url, key, conversion_enabled).await
                     } else {
-                        prepare_client_reconnect(target, &gateway_url, &key, mode).await?;
+                        let (reserved_mutex, catalog) = prepare_client_reconnect(target, &gateway_url, &key, mode).await?;
                         shared.clients.lock().unwrap_or_else(|error| error.into_inner()).insert(target, control.clone());
                         registered = true;
                         crate::local_gateway::mark_reconfiguring(target);
@@ -394,23 +533,26 @@ pub fn start_client_job(
                         // Only then may a new job acquire the per-client mutex and inject its catalog.
                         tokio::select! {
                             _ = cancelled.changed() => Ok(()),
-                            result = crate::runtime_state::run_registered(target, mode,
-                                crate::gui_worker::run(target, &gateway_url, key, mode, conversion_enabled)) => result,
+                            result = async {
+                                let worker = crate::gui_worker::run_with_catalog(target, &gateway_url, key, mode, conversion_enabled, catalog);
+                                if let Some(mutex) = reserved_mutex {
+                                    crate::runtime_state::run_registered_with_mutex(target, mode, worker, mutex).await
+                                } else {
+                                    crate::runtime_state::run_registered(target, mode, worker).await
+                                }
+                            } => result,
                         }
                     }
                 } => result,
             }
-        }).map_err(|error| crate::i18n::runtime_error(&error));
+        }).map_err(|error| crate::i18n::runtime_log_error(&error));
                 if registered {
                     crate::local_gateway::mark_client_disconnected(target);
                     let mut clients = shared.clients.lock().unwrap_or_else(|error| error.into_inner());
                     if clients.get(&target).is_some_and(|active| Arc::ptr_eq(active, &control)) { clients.remove(&target); }
                 }
                 if let Err(error) = &result {
-                    print_line(format_args!(
-                        "\n{}:\n  {error}",
-                        crate::i18n::tr("错误", "Error")
-                    ));
+                    print_line(format_args!("{}", crate::i18n::runtime_error_block(error)));
                 }
                 let _ = completed.send(true);
                 let _ = sender.send(result);
@@ -418,18 +560,37 @@ pub fn start_client_job(
     let mut threads = shared.threads.lock().unwrap_or_else(|e| e.into_inner());
     threads.retain(|thread| !thread.is_finished());
     threads.push(thread);
-    Ok(Job(receiver))
+    Ok(Job(receiver, ready))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_job_readiness_is_separate_from_monitor_completion() {
+        let (sender, receiver) = mpsc::channel();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job = Job(receiver, ready.clone());
+        assert!(!job.is_ready());
+        assert!(job.poll().is_none());
+        ready.store(true, std::sync::atomic::Ordering::Release);
+        assert!(job.is_ready());
+        assert!(job.poll().is_none());
+        sender.send(Ok(())).unwrap();
+        assert!(job.poll().unwrap().is_ok());
+    }
+
     #[tokio::test]
     async fn restart_waits_for_previous_monitor_cleanup() {
         let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
         let (completed, finished) = tokio::sync::watch::channel(false);
-        let control = ClientControl { cancel, finished };
+        let control = ClientControl {
+            model_list_mode: ModelListMode::Gateway,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel,
+            finished,
+        };
         let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cleaned.clone();
         let monitor = tokio::spawn(async move {

@@ -1,109 +1,779 @@
+//! Resolve outbound proxy policy before selecting a connection pool. reqwest's
+//! custom proxy callback loses URL paths and (0.12.28) ignores its NO_PROXY field.
 use anyhow::{Context, Result, bail};
-use reqwest::{ClientBuilder, NoProxy, Proxy, RequestBuilder, Response};
+use reqwest::{ClientBuilder, IntoUrl, Request, Response};
+use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::fmt;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use url::Url;
 
-const PROXY_ENVIRONMENT_KEYS: &[&str] = &[
-    "HTTPS_PROXY",
-    "https_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-];
-const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(test)]
+mod tests;
+#[cfg(windows)]
+mod windows;
+
+const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1,127.0.0.0/8";
 const NETWORK_RETRY_DELAY: Duration = Duration::from_millis(500);
 const PAC_CACHE_TTL: Duration = Duration::from_secs(60);
 
-pub fn builder_for_url(builder: ClientBuilder, target: &str) -> Result<ClientBuilder> {
-    let url = Url::parse(target)?;
-    if matches!(
-        url.host_str(),
-        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+// These strings can contain passwords; Debug must always redact them.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Route {
+    Direct,
+    Proxy(String),
+}
+impl fmt::Debug for Route {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct => f.write_str("Direct"),
+            Self::Proxy(raw) => {
+                let address = Url::parse(raw)
+                    .ok()
+                    .map(|url| {
+                        format!(
+                            "{}://{}:{}",
+                            url.scheme(),
+                            url.host_str().unwrap_or("?"),
+                            url.port_or_known_default().unwrap_or(1080)
+                        )
+                    })
+                    .unwrap_or_else(|| "invalid proxy".into());
+                f.debug_tuple("Proxy").field(&address).finish()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct FixedProxies {
+    http: Option<String>,
+    https: Option<String>,
+    all: Option<String>,
+}
+impl FixedProxies {
+    fn for_url(&self, url: &Url) -> Option<&str> {
+        match url.scheme() {
+            "http" => self.http.as_deref(),
+            "https" => self.https.as_deref(),
+            _ => None,
+        }
+        .or(self.all.as_deref())
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct SystemSettings {
+    fixed: FixedProxies,
+    bypass: Bypass,
+    pac_url: Option<String>,
+    auto_detect: bool,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Settings {
+    environment: FixedProxies,
+    bypass: Bypass,
+    system: SystemSettings,
+}
+impl Settings {
+    fn resolve_current(url: &Url) -> Result<Vec<Route>> {
+        let environment = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
+        let mut settings =
+            Self::from_environment_and_system(environment, SystemSettings::default())?;
+        // An explicit environment route must not depend on an unrelated or
+        // unavailable OS proxy configuration.
+        if is_loopback(url)
+            || settings.bypass.contains(url)
+            || settings.environment.for_url(url).is_some()
+        {
+            return settings.resolve(url);
+        }
+        settings.system = system_settings()?;
+        settings.resolve(url)
+    }
+    fn read() -> Result<Self> {
+        let environment = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
+        Self::from_environment_and_system(environment, system_settings()?)
+    }
+    fn from_environment_and_system(
+        env: HashMap<String, String>,
+        system: SystemSettings,
+    ) -> Result<Self> {
+        let value = |upper: &str, lower: &str| {
+            env.get(upper)
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| env.get(lower).filter(|v| !v.trim().is_empty()))
+                .map(|v| normalize_proxy(v, "http"))
+                .transpose()
+        };
+        Ok(Self {
+            environment: FixedProxies {
+                http: value("HTTP_PROXY", "http_proxy")?,
+                https: value("HTTPS_PROXY", "https_proxy")?,
+                all: value("ALL_PROXY", "all_proxy")?,
+            },
+            bypass: Bypass::parse(&format!(
+                "{LOCAL_NO_PROXY},{}",
+                env.get("NO_PROXY")
+                    .or_else(|| env.get("no_proxy"))
+                    .map(String::as_str)
+                    .unwrap_or_default()
+            )),
+            system,
+        })
+    }
+    fn resolve(&self, url: &Url) -> Result<Vec<Route>> {
+        if is_loopback(url) || self.bypass.contains(url) {
+            return Ok(vec![Route::Direct]);
+        }
+        if let Some(proxy) = self.environment.for_url(url) {
+            return Ok(vec![Route::Proxy(proxy.to_owned())]);
+        }
+        if self.system.bypass.contains(url) {
+            return Ok(vec![Route::Direct]);
+        }
+        if self.system.pac_url.is_some() || self.system.auto_detect {
+            return resolve_auto_cached(url, &self.system);
+        }
+        Ok(vec![
+            self.system
+                .fixed
+                .for_url(url)
+                .map(|p| Route::Proxy(p.to_owned()))
+                .unwrap_or(Route::Direct),
+        ])
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Bypass {
+    patterns: Vec<String>,
+}
+impl Bypass {
+    fn parse(raw: &str) -> Self {
+        Self {
+            patterns: raw
+                .split([',', ';'])
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect(),
+        }
+    }
+    fn contains(&self, url: &Url) -> bool {
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let host = host
+            .trim_matches(['[', ']'])
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        self.patterns.iter().any(|pattern| {
+            if pattern == "*" {
+                return true;
+            }
+            if pattern == "<local>" {
+                return !host.contains('.') && host.parse::<IpAddr>().is_err();
+            }
+            if let Some((network, prefix)) = pattern.split_once('/') {
+                return cidr_contains(network, prefix, &host);
+            }
+            let (pattern, port) = split_bypass_port(pattern);
+            if port.is_some_and(|port| url.port_or_known_default() != Some(port)) {
+                return false;
+            }
+            let pattern = pattern.trim_matches(['[', ']']).trim_end_matches('.');
+            if pattern.contains('*') || pattern.contains('?') {
+                return wildcard_matches(pattern.as_bytes(), host.as_bytes());
+            }
+            let domain = pattern.trim_start_matches('.');
+            if domain.parse::<IpAddr>().is_ok() {
+                return host == domain;
+            }
+            host == domain
+                || (host.ends_with(domain)
+                    && host
+                        .as_bytes()
+                        .get(host.len().saturating_sub(domain.len() + 1))
+                        == Some(&b'.'))
+        })
+    }
+    fn environment_value(&self) -> String {
+        self.patterns.join(",")
+    }
+}
+
+fn split_bypass_port(pattern: &str) -> (&str, Option<u16>) {
+    if pattern.starts_with('[') {
+        if let Some((host, port)) = pattern.rsplit_once("]:") {
+            return (&host[1..], port.parse().ok());
+        }
+    } else if pattern.matches(':').count() == 1
+        && let Some((host, port)) = pattern.rsplit_once(':')
+        && let Ok(port) = port.parse()
+    {
+        return (host, Some(port));
+    }
+    (pattern, None)
+}
+fn cidr_contains(network: &str, prefix: &str, host: &str) -> bool {
+    match (
+        network.parse::<IpAddr>(),
+        host.parse::<IpAddr>(),
+        prefix.parse::<u32>(),
     ) {
-        Ok(builder.no_proxy())
+        (Ok(IpAddr::V4(network)), Ok(IpAddr::V4(host)), Ok(bits @ 0..=32)) => {
+            let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+            u32::from(network) & mask == u32::from(host) & mask
+        }
+        (Ok(IpAddr::V6(network)), Ok(IpAddr::V6(host)), Ok(bits @ 0..=128)) => {
+            let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+            u128::from(network) & mask == u128::from(host) & mask
+        }
+        _ => false,
+    }
+}
+fn wildcard_matches(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t, mut star, mut retry) = (0, 0, None, 0);
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = t;
+        } else if let Some(at) = star {
+            retry += 1;
+            t = retry;
+            p = at + 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+fn is_loopback(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
+fn normalize_proxy(raw: &str, default_scheme: &str) -> Result<String> {
+    let raw = raw.trim();
+    let candidate = if raw.contains("://") {
+        raw.to_owned()
     } else {
-        configure_reqwest_builder(builder)
+        format!("{default_scheme}://{raw}")
+    };
+    let url = Url::parse(&candidate)
+        .map_err(|_| anyhow::anyhow!("代理地址格式无效 / Invalid proxy address"))?;
+    if !matches!(
+        url.scheme(),
+        "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+    ) || url.host_str().is_none()
+        || url.port() == Some(0)
+        || url.path() != "/" && !url.path().is_empty()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!(
+            "代理地址需使用 HTTP、HTTPS 或 SOCKS，并且不能包含路径 / Invalid proxy protocol or path"
+        );
     }
+    Ok(url.to_string().trim_end_matches('/').to_owned())
 }
-
-#[derive(Clone)]
-enum WindowsProxyConfig {
-    Fixed(String),
-    Auto {
-        pac_url: Option<String>,
-        auto_detect: bool,
-    },
+fn parse_fixed_proxies(raw: &str) -> Result<FixedProxies> {
+    let mut fixed = FixedProxies::default();
+    for entry in raw.split(';').map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some((scheme, address)) = entry.split_once('=')
+            && matches!(
+                scheme.trim().to_ascii_lowercase().as_str(),
+                "http" | "https" | "socks" | "socks5"
+            )
+        {
+            let scheme = scheme.trim().to_ascii_lowercase();
+            let proxy = normalize_proxy(
+                address,
+                if scheme.starts_with("socks") {
+                    "socks5h"
+                } else {
+                    "http"
+                },
+            )?;
+            match scheme.as_str() {
+                "http" => fixed.http = Some(proxy),
+                "https" => fixed.https = Some(proxy),
+                _ => fixed.all = Some(proxy),
+            }
+        } else {
+            fixed.all = Some(normalize_proxy(entry, "http")?);
+        }
+    }
+    Ok(fixed)
 }
-
-#[derive(Clone)]
-struct CachedProxy {
+struct CachedAuto {
+    settings: SystemSettings,
     resolved_at: Instant,
-    proxy_url: Option<String>,
+    routes: Vec<Route>,
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn refresh_macos_pac() {
+    macos::refresh_cache();
 }
 
-pub fn configure_reqwest_builder(builder: ClientBuilder) -> Result<ClientBuilder> {
-    if environment_proxy_configured() {
-        return Ok(builder);
+#[cfg(target_os = "macos")]
+fn resolve_auto_cached(url: &Url, settings: &SystemSettings) -> Result<Vec<Route>> {
+    macos::resolve_cached(url, settings)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_auto_cached(url: &Url, settings: &SystemSettings) -> Result<Vec<Route>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedAuto>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    // PAC may inspect URL paths, so caching only the origin is incorrect.
+    let key = url.as_str().to_owned();
+    if let Ok(cache) = cache.lock()
+        && let Some(cached) = cache.get(&key)
+        && cached.settings == *settings
+        && cached.resolved_at.elapsed() < PAC_CACHE_TTL
+    {
+        return Ok(cached.routes.clone());
     }
-    let Some(config) = windows_system_proxy_config()? else {
-        return Ok(builder);
-    };
-    let no_proxy = NoProxy::from_string(&merged_no_proxy());
-    match config {
-        WindowsProxyConfig::Fixed(proxy_url) => {
-            let proxy = Proxy::all(&proxy_url)
-                .with_context(|| format!("Windows 系统代理地址无效: {proxy_url}"))?
-                .no_proxy(no_proxy);
-            Ok(builder.proxy(proxy))
+    let routes = resolve_system_auto(url, settings)
+        .context("自动代理解析失败 / Automatic proxy resolution failed")?;
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= 128 {
+            cache.clear();
         }
-        WindowsProxyConfig::Auto {
-            pac_url,
-            auto_detect,
-        } => {
-            let cache = Arc::new(Mutex::new(HashMap::<String, CachedProxy>::new()));
-            let proxy = Proxy::custom(move |url| {
-                resolve_auto_proxy_cached(url, pac_url.as_deref(), auto_detect, &cache)
-                    .unwrap_or_else(|_| Some("http://127.0.0.1:0".to_owned()))
-            })
-            .no_proxy(no_proxy);
-            Ok(builder.proxy(proxy))
+        cache.insert(
+            key,
+            CachedAuto {
+                settings: settings.clone(),
+                resolved_at: Instant::now(),
+                routes: routes.clone(),
+            },
+        );
+    }
+    Ok(routes)
+}
+#[cfg(windows)]
+fn system_settings() -> Result<SystemSettings> {
+    windows::settings()
+}
+#[cfg(windows)]
+fn resolve_system_auto(url: &Url, settings: &SystemSettings) -> Result<Vec<Route>> {
+    windows::resolve(url, settings)
+}
+#[cfg(target_os = "macos")]
+fn system_settings() -> Result<SystemSettings> {
+    macos::settings()
+}
+#[cfg(target_os = "macos")]
+fn resolve_system_auto(url: &Url, settings: &SystemSettings) -> Result<Vec<Route>> {
+    macos::resolve(url, settings)
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn system_settings() -> Result<SystemSettings> {
+    Ok(SystemSettings::default())
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn resolve_system_auto(_url: &Url, _settings: &SystemSettings) -> Result<Vec<Route>> {
+    Ok(vec![Route::Direct])
+}
+
+type Factory = dyn Fn() -> ClientBuilder + Send + Sync;
+type Resolver = dyn Fn(&Url) -> Result<Vec<Route>> + Send + Sync;
+
+#[derive(Clone)]
+pub struct Client {
+    inner: Arc<ClientInner>,
+}
+struct ClientInner {
+    template: reqwest::Client,
+    factory: Option<Box<Factory>>,
+    clients: Mutex<HashMap<Route, reqwest::Client>>,
+    resolver: Box<Resolver>,
+    redirects: usize,
+    timeout: Option<Duration>,
+}
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetworkClient")
+    }
+}
+impl Client {
+    pub fn new(factory: impl Fn() -> ClientBuilder + Send + Sync + 'static) -> Result<Self> {
+        Self::with_resolver(
+            factory,
+            |url| {
+                if is_loopback(url) {
+                    Ok(vec![Route::Direct])
+                } else {
+                    Settings::resolve_current(url)
+                }
+            },
+            10,
+        )
+    }
+    fn with_resolver(
+        factory: impl Fn() -> ClientBuilder + Send + Sync + 'static,
+        resolver: impl Fn(&Url) -> Result<Vec<Route>> + Send + Sync + 'static,
+        redirects: usize,
+    ) -> Result<Self> {
+        let template = factory()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()?;
+        Ok(Self {
+            inner: Arc::new(ClientInner {
+                template,
+                factory: Some(Box::new(factory)),
+                clients: Mutex::new(HashMap::new()),
+                resolver: Box::new(resolver),
+                redirects,
+                timeout: None,
+            }),
+        })
+    }
+    pub fn redirect_limit(mut self, limit: usize) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("configure before sharing a client")
+            .redirects = limit;
+        self
+    }
+    pub fn total_timeout(mut self, timeout: Duration) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("configure before sharing a client")
+            .timeout = Some(timeout);
+        self
+    }
+    pub fn direct(client: reqwest::Client) -> Self {
+        Self {
+            inner: Arc::new(ClientInner {
+                template: client,
+                factory: None,
+                clients: Mutex::new(HashMap::new()),
+                resolver: Box::new(|_| Ok(vec![Route::Direct])),
+                redirects: 0,
+                timeout: None,
+            }),
+        }
+    }
+    pub fn get(&self, url: impl IntoUrl) -> RequestBuilder {
+        self.request(reqwest::Method::GET, url)
+    }
+    pub fn request(&self, method: reqwest::Method, url: impl IntoUrl) -> RequestBuilder {
+        RequestBuilder {
+            client: self.clone(),
+            request: self.inner.template.request(method, url),
+        }
+    }
+    fn client_for(&self, route: &Route) -> Result<reqwest::Client> {
+        let Some(factory) = &self.inner.factory else {
+            return Ok(self.inner.template.clone());
+        };
+        let mut clients =
+            self.inner.clients.lock().map_err(|_| {
+                anyhow::anyhow!("代理连接池不可用 / Proxy connection pool unavailable")
+            })?;
+        if let Some(client) = clients.get(route) {
+            return Ok(client.clone());
+        }
+        let mut builder = factory()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never());
+        if let Route::Proxy(proxy) = route {
+            builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+        }
+        let client = builder.build()?;
+        if clients.len() >= 16 {
+            clients.clear();
+        }
+        clients.insert(route.clone(), client.clone());
+        Ok(client)
+    }
+    async fn execute(
+        &self,
+        mut request: Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> std::result::Result<Response, Error> {
+        for redirects in 0..=self.inner.redirects {
+            let resolver = self.inner.clone();
+            let url = request.url().clone();
+            let routes = tokio::task::spawn_blocking(move || (resolver.resolver)(&url))
+                .await
+                .map_err(|_| Error::policy("代理设置读取失败 / Could not read proxy settings"))?
+                .map_err(Error::Policy)?;
+            if routes.is_empty() {
+                return Err(Error::policy("未找到可用代理路由 / No usable proxy route"));
+            }
+            let mut response = None;
+            for (index, route) in routes.iter().enumerate() {
+                let mut attempt = request.try_clone().ok_or_else(|| {
+                    Error::policy("请求体不支持安全重放 / Request body cannot be replayed safely")
+                })?;
+                if let Some(deadline) = deadline {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(Error::Timeout);
+                    }
+                    *attempt.timeout_mut() = Some(remaining);
+                }
+                match self
+                    .client_for(route)
+                    .map_err(Error::Policy)?
+                    .execute(attempt)
+                    .await
+                {
+                    Ok(result) => {
+                        response = Some(result);
+                        break;
+                    }
+                    // Only connection failures precede user request bytes.
+                    // Never replay on response, body, stream errors or 407.
+                    Err(error)
+                        if error.is_connect()
+                            && !is_proxy_auth_error(&error)
+                            && index + 1 < routes.len() =>
+                    {
+                        tracing::warn!(route = ?route, "代理连接失败，尝试下一条 PAC 路由 / Proxy connection failed; trying next PAC route");
+                    }
+                    Err(error) => {
+                        return Err(Error::Transport {
+                            error: error.without_url(),
+                            route: format!("{route:?}"),
+                        });
+                    }
+                }
+            }
+            let response =
+                response.ok_or_else(|| Error::policy("代理连接失败 / Proxy connection failed"))?;
+            if !is_redirect(response.status()) || self.inner.redirects == 0 {
+                return Ok(response);
+            }
+            let Some(location) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
+                return Ok(response);
+            };
+            if redirects == self.inner.redirects {
+                return Err(Error::policy("重定向次数过多 / Too many redirects"));
+            }
+            let next = request
+                .url()
+                .join(location)
+                .map_err(|_| Error::policy("无效的重定向地址 / Invalid redirect URL"))?;
+            if !matches!(next.scheme(), "http" | "https")
+                || !next.username().is_empty()
+                || next.password().is_some()
+                || request.url().scheme() == "https" && next.scheme() == "http"
+            {
+                return Err(Error::policy(
+                    "拒绝不安全的重定向 / Unsafe redirect rejected",
+                ));
+            }
+            if next.origin() != request.url().origin() {
+                for header in [
+                    "authorization",
+                    "cookie",
+                    "proxy-authorization",
+                    "x-api-key",
+                    "x-goog-api-key",
+                    "host",
+                ] {
+                    request.headers_mut().remove(header);
+                }
+            }
+            if response.status() == reqwest::StatusCode::SEE_OTHER
+                && request.method() != reqwest::Method::HEAD
+                || matches!(
+                    response.status(),
+                    reqwest::StatusCode::MOVED_PERMANENTLY | reqwest::StatusCode::FOUND
+                ) && request.method() == reqwest::Method::POST
+            {
+                *request.method_mut() = reqwest::Method::GET;
+                *request.body_mut() = None;
+                for header in [
+                    "content-length",
+                    "content-type",
+                    "transfer-encoding",
+                    "content-encoding",
+                ] {
+                    request.headers_mut().remove(header);
+                }
+            }
+            *request.url_mut() = next;
+        }
+        unreachable!()
+    }
+}
+fn is_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+fn is_proxy_auth_error(error: &reqwest::Error) -> bool {
+    // These connector error enums are private in the locked hyper-util API.
+    // CONNECT 407 and SOCKS authentication errors are connection errors too,
+    // but must never cause a switch to a different proxy or DIRECT.
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = cause {
+        let message = error.to_string();
+        if [
+            "proxy authorization required",
+            "credentials not accepted",
+            "server does not support user/pass authentication",
+            "server implements authentication incorrectly",
+        ]
+        .iter()
+        .any(|text| message.contains(text))
+        {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
+}
+impl From<reqwest::Client> for Client {
+    fn from(client: reqwest::Client) -> Self {
+        Self::direct(client)
+    }
+}
+
+pub struct RequestBuilder {
+    client: Client,
+    request: reqwest::RequestBuilder,
+}
+impl RequestBuilder {
+    pub fn header<K, V>(mut self, key: K, value: V) -> Self
+    where
+        reqwest::header::HeaderName: TryFrom<K>,
+        <reqwest::header::HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        reqwest::header::HeaderValue: TryFrom<V>,
+        <reqwest::header::HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        self.request = self.request.header(key, value);
+        self
+    }
+    pub fn query<T: Serialize + ?Sized>(mut self, query: &T) -> Self {
+        self.request = self.request.query(query);
+        self
+    }
+    pub fn body(mut self, body: impl Into<reqwest::Body>) -> Self {
+        self.request = self.request.body(body);
+        self
+    }
+    pub fn try_clone(&self) -> Option<Self> {
+        Some(Self {
+            client: self.client.clone(),
+            request: self.request.try_clone()?,
+        })
+    }
+    pub async fn send(self) -> std::result::Result<Response, Error> {
+        let request = self.request.build().map_err(Error::Request)?;
+        let timeout = request.timeout().copied().or(self.client.inner.timeout);
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+        let operation = self.client.execute(request, deadline);
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, operation)
+                .await
+                .map_err(|_| Error::Timeout)?
+        } else {
+            operation.await
         }
     }
 }
 
-pub fn child_proxy_environment(target_url: &str) -> Result<Vec<(String, String)>> {
-    if environment_proxy_configured() {
-        return Ok(vec![("NO_PROXY".to_owned(), merged_no_proxy())]);
+#[derive(Debug)]
+pub enum Error {
+    Policy(anyhow::Error),
+    Request(reqwest::Error),
+    Transport {
+        error: reqwest::Error,
+        route: String,
+    },
+    Timeout,
+}
+impl Error {
+    fn policy(message: &str) -> Self {
+        Self::Policy(anyhow::anyhow!("{message}"))
     }
-    let Some(config) = windows_system_proxy_config()? else {
-        return Ok(Vec::new());
-    };
-    let proxy_url = match config {
-        WindowsProxyConfig::Fixed(proxy_url) => Some(proxy_url),
-        WindowsProxyConfig::Auto {
-            pac_url,
-            auto_detect,
-        } => resolve_windows_auto_proxy(target_url, pac_url.as_deref(), auto_detect)?,
-    };
-    let Some(proxy_url) = proxy_url else {
-        return Ok(vec![("NO_PROXY".to_owned(), merged_no_proxy())]);
-    };
-    Ok(vec![
-        ("HTTP_PROXY".to_owned(), proxy_url.clone()),
-        ("HTTPS_PROXY".to_owned(), proxy_url),
-        ("NO_PROXY".to_owned(), merged_no_proxy()),
-    ])
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Policy(_) | Self::Request(_) => false,
+            Self::Transport { error, .. } => !is_proxy_auth_error(error),
+            Self::Timeout => true,
+        }
+    }
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout)
+            || matches!(self, Self::Request(error) | Self::Transport { error, .. } if error.is_timeout())
+    }
+    pub fn is_connect(&self) -> bool {
+        matches!(self, Self::Request(error) | Self::Transport { error, .. } if error.is_connect())
+    }
+    pub fn without_url(self) -> Self {
+        match self {
+            Self::Request(error) => Self::Request(error.without_url()),
+            Self::Transport { error, route } => Self::Transport {
+                error: error.without_url(),
+                route,
+            },
+            other => other,
+        }
+    }
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Policy(error) => write!(f, "{error:#}"),
+            Self::Request(error) => error.fmt(f),
+            Self::Transport { error, route } => {
+                write!(f, "网络路由 / Network route: {route}; {error}")
+            }
+            Self::Timeout => f.write_str("网络请求超时 / Network request timed out"),
+        }
+    }
+}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Policy(error) => Some(error.as_ref()),
+            Self::Request(error) => Some(error),
+            Self::Transport { error, .. } => Some(error),
+            Self::Timeout => None,
+        }
+    }
 }
 
-/// Retry only failures returned before an HTTP response exists. Callers must
-/// not use this helper for billable or otherwise non-idempotent user requests.
-pub async fn send_with_network_retry(request: RequestBuilder) -> reqwest::Result<Response> {
+/// Only for non-billable, replay-safe discovery requests.
+pub async fn send_with_network_retry(
+    request: RequestBuilder,
+) -> std::result::Result<Response, Error> {
     let retry = request.try_clone();
     match request.send().await {
         Ok(response) => Ok(response),
+        Err(error) if !error.is_retryable() => Err(error),
         Err(error) => {
             let Some(retry) = retry else {
                 return Err(error);
@@ -114,387 +784,45 @@ pub async fn send_with_network_retry(request: RequestBuilder) -> reqwest::Result
     }
 }
 
-fn environment_proxy_configured() -> bool {
-    PROXY_ENVIRONMENT_KEYS.iter().any(|name| {
-        std::env::var_os(name).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
-    })
+pub fn child_proxy_environment(target_url: &str) -> Result<Vec<(String, String)>> {
+    let settings = Settings::read()?;
+    let url = Url::parse(target_url)?;
+    child_environment(&settings, &url)
 }
 
-fn merged_no_proxy() -> String {
-    let existing = std::env::var("NO_PROXY")
-        .or_else(|_| std::env::var("no_proxy"))
-        .unwrap_or_default();
-    if existing.trim().is_empty() {
-        LOCAL_NO_PROXY.to_owned()
-    } else {
-        format!("{LOCAL_NO_PROXY},{}", existing.trim())
-    }
-}
-
-fn resolve_auto_proxy_cached(
-    target_url: &Url,
-    pac_url: Option<&str>,
-    auto_detect: bool,
-    cache: &Mutex<HashMap<String, CachedProxy>>,
-) -> Result<Option<String>> {
-    let key = target_url.origin().ascii_serialization();
-    if let Ok(cache) = cache.lock()
-        && let Some(cached) = cache.get(&key)
-        && cached.resolved_at.elapsed() < PAC_CACHE_TTL
-    {
-        return Ok(cached.proxy_url.clone());
-    }
-
-    let proxy_url = resolve_windows_auto_proxy(target_url.as_str(), pac_url, auto_detect)?;
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(
-            key,
-            CachedProxy {
-                resolved_at: Instant::now(),
-                proxy_url: proxy_url.clone(),
-            },
-        );
-    }
-    Ok(proxy_url)
-}
-
-#[cfg(windows)]
-fn windows_system_proxy_config() -> Result<Option<WindowsProxyConfig>> {
-    use winreg::RegKey;
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
-
-    let internet_settings = match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
-        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        KEY_READ,
-    ) {
-        Ok(key) => key,
-        Err(_) => return Ok(None),
-    };
-    let enabled = internet_settings
-        .get_value::<u32, _>("ProxyEnable")
-        .unwrap_or(0)
-        != 0;
-    if enabled {
-        let raw = internet_settings
-            .get_value::<String, _>("ProxyServer")
-            .unwrap_or_default();
-        if let Some(proxy_url) = normalize_windows_proxy_server(&raw)? {
-            return Ok(Some(WindowsProxyConfig::Fixed(proxy_url)));
-        }
-    }
-
-    let pac_url = internet_settings
-        .get_value::<String, _>("AutoConfigURL")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    let auto_detect = internet_settings
-        .get_value::<u32, _>("AutoDetect")
-        .unwrap_or(0)
-        != 0;
-    if pac_url.is_some() || auto_detect {
-        Ok(Some(WindowsProxyConfig::Auto {
-            pac_url,
-            auto_detect,
-        }))
-    } else {
-        Ok(None)
-    }
-}
-
-#[cfg(not(windows))]
-fn windows_system_proxy_config() -> Result<Option<WindowsProxyConfig>> {
-    Ok(None)
-}
-
-#[cfg(windows)]
-fn resolve_windows_auto_proxy(
-    target_url: &str,
-    pac_url: Option<&str>,
-    auto_detect: bool,
-) -> Result<Option<String>> {
-    use std::ffi::c_void;
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::HGLOBAL;
-    use windows::Win32::Networking::WinHttp::{
-        WINHTTP_ACCESS_TYPE_NAMED_PROXY, WINHTTP_ACCESS_TYPE_NO_PROXY,
-        WINHTTP_AUTO_DETECT_TYPE_DHCP, WINHTTP_AUTO_DETECT_TYPE_DNS_A,
-        WINHTTP_AUTOPROXY_AUTO_DETECT, WINHTTP_AUTOPROXY_CONFIG_URL, WINHTTP_AUTOPROXY_OPTIONS,
-        WINHTTP_PROXY_INFO, WinHttpCloseHandle, WinHttpGetProxyForUrl, WinHttpOpen,
-        WinHttpSetTimeouts,
-    };
-    use windows::core::{Error, Owned, PCWSTR};
-
-    struct Session(*mut c_void);
-    impl Drop for Session {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                let _ = unsafe { WinHttpCloseHandle(self.0) };
+fn child_environment(settings: &Settings, url: &Url) -> Result<Vec<(String, String)>> {
+    let mut bypass = settings.bypass.clone();
+    bypass
+        .patterns
+        .extend(settings.system.bypass.patterns.clone());
+    let mut result = vec![
+        ("NO_PROXY".to_owned(), bypass.environment_value()),
+        ("no_proxy".to_owned(), bypass.environment_value()),
+    ];
+    // Environment variables cannot encode per-URL PAC rules. Model traffic
+    // from loopback clients is resolved independently by our local gateway.
+    for (upper, lower, scheme) in [
+        ("HTTP_PROXY", "http_proxy", "http"),
+        ("HTTPS_PROXY", "https_proxy", "https"),
+    ] {
+        let mut target = url.clone();
+        let _ = target.set_scheme(scheme);
+        let value = if let Some(value) = settings.environment.for_url(&target) {
+            Some(value.to_owned())
+        } else if !is_loopback(url)
+            && (settings.system.pac_url.is_some() || settings.system.auto_detect)
+        {
+            match settings.resolve(&target)?.into_iter().next() {
+                Some(Route::Proxy(value)) => Some(value),
+                _ => None,
             }
+        } else {
+            settings.system.fixed.for_url(&target).map(str::to_owned)
+        };
+        if let Some(value) = value {
+            result.push((upper.to_owned(), value.clone()));
+            result.push((lower.to_owned(), value));
         }
     }
-
-    let agent = "znnz-agent-launcher\0".encode_utf16().collect::<Vec<_>>();
-    let session = Session(unsafe {
-        WinHttpOpen(
-            PCWSTR(agent.as_ptr()),
-            WINHTTP_ACCESS_TYPE_NO_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        )
-    });
-    if session.0.is_null() {
-        return Err(Error::from_thread()).context("无法创建 Windows PAC 解析会话");
-    }
-    unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 5_000, 5_000) }
-        .context("无法设置 Windows PAC 解析超时")?;
-
-    let target = std::ffi::OsStr::new(target_url)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let pac = pac_url.map(|value| {
-        std::ffi::OsStr::new(value)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>()
-    });
-    let mut options = WINHTTP_AUTOPROXY_OPTIONS {
-        dwFlags: (if pac.is_some() {
-            WINHTTP_AUTOPROXY_CONFIG_URL
-        } else {
-            0
-        }) | (if auto_detect {
-            WINHTTP_AUTOPROXY_AUTO_DETECT
-        } else {
-            0
-        }),
-        dwAutoDetectFlags: if auto_detect {
-            WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A
-        } else {
-            0
-        },
-        lpszAutoConfigUrl: pac
-            .as_ref()
-            .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr())),
-        fAutoLogonIfChallenged: true.into(),
-        ..Default::default()
-    };
-    let mut info = WINHTTP_PROXY_INFO::default();
-    unsafe { WinHttpGetProxyForUrl(session.0, PCWSTR(target.as_ptr()), &mut options, &mut info) }
-        .with_context(|| format!("Windows 无法为 {target_url} 解析 PAC 代理"))?;
-
-    let _proxy_memory = if info.lpszProxy.0.is_null() {
-        None
-    } else {
-        Some(unsafe { Owned::new(HGLOBAL(info.lpszProxy.0.cast())) })
-    };
-    let _bypass_memory = if info.lpszProxyBypass.0.is_null() {
-        None
-    } else {
-        Some(unsafe { Owned::new(HGLOBAL(info.lpszProxyBypass.0.cast())) })
-    };
-    if info.dwAccessType != WINHTTP_ACCESS_TYPE_NAMED_PROXY || info.lpszProxy.0.is_null() {
-        return Ok(None);
-    }
-    let raw = unsafe { PCWSTR(info.lpszProxy.0).to_string() }
-        .context("Windows PAC 返回了无效代理地址")?;
-    normalize_resolved_proxy(&raw)
-}
-
-#[cfg(not(windows))]
-fn resolve_windows_auto_proxy(
-    _target_url: &str,
-    _pac_url: Option<&str>,
-    _auto_detect: bool,
-) -> Result<Option<String>> {
-    Ok(None)
-}
-
-fn normalize_resolved_proxy(raw: &str) -> Result<Option<String>> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw.eq_ignore_ascii_case("DIRECT") {
-        return Ok(None);
-    }
-    if raw.contains('=') {
-        return normalize_windows_proxy_server(raw);
-    }
-    let selected = raw.split(';').next().unwrap_or(raw).trim();
-    let selected = ["PROXY ", "HTTPS ", "HTTP "]
-        .iter()
-        .find_map(|prefix| {
-            selected
-                .get(..prefix.len())
-                .filter(|head| head.eq_ignore_ascii_case(prefix))
-                .map(|_| selected[prefix.len()..].trim())
-        })
-        .unwrap_or(selected);
-    normalize_windows_proxy_server(selected)
-}
-
-fn normalize_windows_proxy_server(raw: &str) -> Result<Option<String>> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-
-    let selected = if raw.contains('=') {
-        let entries = raw
-            .split(';')
-            .filter_map(|entry| entry.trim().split_once('='))
-            .map(|(scheme, address)| (scheme.trim().to_ascii_lowercase(), address.trim()))
-            .collect::<Vec<_>>();
-        entries
-            .iter()
-            .find(|(scheme, _)| scheme == "https")
-            .or_else(|| entries.iter().find(|(scheme, _)| scheme == "http"))
-            .map(|(_, address)| *address)
-    } else {
-        Some(raw)
-    };
-    let Some(selected) = selected.filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-
-    let candidate = if selected.contains("://") {
-        selected.to_owned()
-    } else {
-        format!("http://{selected}")
-    };
-    let parsed =
-        Url::parse(&candidate).with_context(|| format!("Windows 系统代理地址无效: {selected}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        bail!("Windows 系统代理不是可用的 HTTP/HTTPS 代理: {selected}");
-    }
-    Ok(Some(candidate.trim_end_matches('/').to_owned()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
-
-    fn read_request_headers(stream: &std::net::TcpStream) {
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                break;
-            }
-        }
-    }
-
-    #[test]
-    fn normalizes_common_windows_fixed_proxy_formats() {
-        assert_eq!(
-            normalize_windows_proxy_server("127.0.0.1:10808").unwrap(),
-            Some("http://127.0.0.1:10808".to_owned())
-        );
-        assert_eq!(
-            normalize_windows_proxy_server("http=127.0.0.1:8080;https=127.0.0.1:10808").unwrap(),
-            Some("http://127.0.0.1:10808".to_owned())
-        );
-        assert_eq!(normalize_windows_proxy_server("").unwrap(), None);
-    }
-
-    #[test]
-    fn normalizes_winhttp_and_pac_proxy_results() {
-        assert_eq!(
-            normalize_resolved_proxy("PROXY 127.0.0.1:10808; DIRECT").unwrap(),
-            Some("http://127.0.0.1:10808".to_owned())
-        );
-        assert_eq!(normalize_resolved_proxy("DIRECT").unwrap(), None);
-    }
-
-    #[test]
-    fn rejects_non_http_windows_proxy_protocols() {
-        assert!(normalize_windows_proxy_server("socks5://127.0.0.1:10808").is_err());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_winhttp_evaluates_a_pac_url_for_the_target() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_request_headers(&stream);
-            let body =
-                b"function FindProxyForURL(url, host) { return 'PROXY 127.0.0.1:18080; DIRECT'; }";
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            stream.write_all(body).unwrap();
-        });
-
-        let proxy = resolve_windows_auto_proxy(
-            "https://gateway.example.com/v1/models",
-            Some(&format!("http://{address}/proxy.pac")),
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(proxy.as_deref(), Some("http://127.0.0.1:18080"));
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn retries_once_when_no_http_response_is_received() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (first, _) = listener.accept().unwrap();
-            read_request_headers(&first);
-            drop(first);
-
-            let (mut second, _) = listener.accept().unwrap();
-            read_request_headers(&second);
-            second
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-                .unwrap();
-        });
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let response = send_with_network_retry(client.get(format!("http://{address}/models")))
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.text().await.unwrap(), "ok");
-        server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn does_not_retry_an_explicit_http_error() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(false).unwrap();
-        let server_listener = listener.try_clone().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = server_listener.accept().unwrap();
-            read_request_headers(&stream);
-            stream
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
-        });
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let response = send_with_network_retry(client.get(format!("http://{address}/models")))
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-        server.join().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        assert!(matches!(
-            listener.accept(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
-    }
+    Ok(result)
 }

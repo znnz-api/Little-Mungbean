@@ -952,7 +952,7 @@ fn gemini_response_to_chat(value: Value) -> Value {
     if !calls.is_empty() {
         message["tool_calls"] = Value::Array(calls);
     }
-    json!({"id":value.get("responseId").cloned().unwrap_or_else(||json!("chatcmpl-agent-switch")),"object":"chat.completion","model":value.get("modelVersion").cloned().unwrap_or(Value::Null),"choices":[{"index":0,"message":message,"finish_reason":"stop"}],"usage":value.get("usageMetadata").cloned().unwrap_or(Value::Null)})
+    json!({"id":value.get("responseId").cloned().unwrap_or_else(||json!("chatcmpl-little-mungbean")),"object":"chat.completion","model":value.get("modelVersion").cloned().unwrap_or(Value::Null),"choices":[{"index":0,"message":message,"finish_reason":"stop"}],"usage":value.get("usageMetadata").cloned().unwrap_or(Value::Null)})
 }
 
 fn responses_response_to_chat(value: Value) -> Value {
@@ -961,7 +961,7 @@ fn responses_response_to_chat(value: Value) -> Value {
         .and_then(Value::as_str)
         .or_else(|| value.get("output_text").and_then(Value::as_str))
         .unwrap_or_default();
-    json!({"id":value.get("id").cloned().unwrap_or(json!("chatcmpl-agent-switch")),"object":"chat.completion","model":value.get("model").cloned().unwrap_or(Value::Null),"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":value.get("usage").cloned().unwrap_or(Value::Null)})
+    json!({"id":value.get("id").cloned().unwrap_or(json!("chatcmpl-little-mungbean")),"object":"chat.completion","model":value.get("model").cloned().unwrap_or(Value::Null),"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":value.get("usage").cloned().unwrap_or(Value::Null)})
 }
 fn chat_response_to_responses(value: Value) -> Value {
     let message = value
@@ -974,11 +974,11 @@ fn chat_response_to_responses(value: Value) -> Value {
         .unwrap_or_default();
     let mut output = Vec::new();
     if !text.is_empty() {
-        output.push(json!({"type":"message","id":"msg_agent_switch","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]}));
+        output.push(json!({"type":"message","id":"msg_little_mungbean","role":"assistant","status":"completed","content":[{"type":"output_text","text":text,"annotations":[]}]}));
     }
     if let Some(calls) = message["tool_calls"].as_array() {
         for (index, call) in calls.iter().enumerate() {
-            output.push(json!({"type":"function_call","id":format!("fc_agent_switch_{index}"),"status":"completed",
+            output.push(json!({"type":"function_call","id":format!("fc_little_mungbean_{index}"),"status":"completed",
                 "call_id":call.get("id"),"name":call.pointer("/function/name"),"arguments":call.pointer("/function/arguments")}));
         }
     }
@@ -988,7 +988,7 @@ fn chat_response_to_responses(value: Value) -> Value {
         "total_tokens":usage.get("total_tokens").cloned().unwrap_or(Value::Null),
         "input_tokens_details":{"cached_tokens":usage.pointer("/prompt_tokens_details/cached_tokens").cloned().unwrap_or(json!(0))}
     })).unwrap_or(Value::Null);
-    json!({"id":value.get("id").cloned().unwrap_or(json!("resp_agent_switch")),"object":"response","status":"completed","model":value.get("model").cloned().unwrap_or(Value::Null),"output":output,"output_text":text,"usage":usage})
+    json!({"id":value.get("id").cloned().unwrap_or(json!("resp_little_mungbean")),"object":"response","status":"completed","model":value.get("model").cloned().unwrap_or(Value::Null),"output":output,"output_text":text,"usage":usage})
 }
 fn messages_response_to_chat(value: Value) -> Value {
     let blocks = value
@@ -1002,7 +1002,7 @@ fn messages_response_to_chat(value: Value) -> Value {
         .collect::<Vec<_>>()
         .join("");
     let tool_calls = blocks.iter().filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use")).map(|block| json!({
-        "id": block.get("id").cloned().unwrap_or_else(|| json!("call_agent_switch")),
+        "id": block.get("id").cloned().unwrap_or_else(|| json!("call_little_mungbean")),
         "type": "function",
         "function": {
             "name": block.get("name").cloned().unwrap_or(Value::Null),
@@ -1035,7 +1035,7 @@ fn messages_response_to_chat(value: Value) -> Value {
             "prompt_tokens_details":{"cached_tokens":read,"cache_write_tokens":write}})
         })
         .unwrap_or(Value::Null);
-    json!({"id":value.get("id").cloned().unwrap_or(json!("chatcmpl-agent-switch")),"object":"chat.completion","model":value.get("model").cloned().unwrap_or(Value::Null),"choices":[{"index":0,"message":message,"finish_reason":finish_reason}],"usage":usage})
+    json!({"id":value.get("id").cloned().unwrap_or(json!("chatcmpl-little-mungbean")),"object":"chat.completion","model":value.get("model").cloned().unwrap_or(Value::Null),"choices":[{"index":0,"message":message,"finish_reason":finish_reason}],"usage":usage})
 }
 fn chat_response_to_messages(value: Value) -> Value {
     let message = value
@@ -1057,7 +1057,7 @@ fn chat_response_to_messages(value: Value) -> Value {
                 .and_then(Value::as_str)
                 .and_then(|value| serde_json::from_str::<Value>(value).ok())
                 .unwrap_or_else(|| json!({}));
-            content.push(json!({"type":"tool_use","id":call.get("id").cloned().unwrap_or_else(|| json!("call_agent_switch")),"name":call.pointer("/function/name").cloned().unwrap_or(Value::Null),"input":input}));
+            content.push(json!({"type":"tool_use","id":call.get("id").cloned().unwrap_or_else(|| json!("call_little_mungbean")),"name":call.pointer("/function/name").cloned().unwrap_or(Value::Null),"input":input}));
         }
     }
     if content.is_empty() {
@@ -1080,7 +1080,7 @@ fn chat_response_to_messages(value: Value) -> Value {
     if let Some(output) = usage.get("completion_tokens").cloned() {
         usage["output_tokens"] = output;
     }
-    json!({"id":value.get("id").cloned().unwrap_or(json!("msg_agent_switch")),"type":"message","role":"assistant","model":value.get("model").cloned().unwrap_or(Value::Null),"content":content,"stop_reason":if message.get("tool_calls").is_some() { json!("tool_use") } else if value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length") { json!("max_tokens") } else { json!("end_turn") },"stop_sequence":Value::Null,"usage":usage})
+    json!({"id":value.get("id").cloned().unwrap_or(json!("msg_little_mungbean")),"type":"message","role":"assistant","model":value.get("model").cloned().unwrap_or(Value::Null),"content":content,"stop_reason":if message.get("tool_calls").is_some() { json!("tool_use") } else if value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length") { json!("max_tokens") } else { json!("end_turn") },"stop_sequence":Value::Null,"usage":usage})
 }
 
 #[cfg(test)]

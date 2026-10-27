@@ -92,7 +92,7 @@ impl ChatToMessages {
         };
         if !self.started {
             pending.push_back(frame(json!({"type":"message_start","message":{
-                "id":value.get("id").and_then(Value::as_str).unwrap_or("msg_agent_switch"),
+                "id":value.get("id").and_then(Value::as_str).unwrap_or("msg_little_mungbean"),
                 "type":"message","role":"assistant",
                 "model":value.get("model").and_then(Value::as_str).unwrap_or("unknown"),
                 "content":[],"stop_reason":null,"stop_sequence":null,

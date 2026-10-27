@@ -4,17 +4,18 @@ use crate::claude_desktop_proxy::{
 };
 use crate::{catalog, claude_desktop_registry as registry, i18n, platform};
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 use std::time::Duration;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
-const DISCOVERY_CLIENT_VERSION: &str = "claude-desktop-1.24012.9";
+pub(crate) const DISCOVERY_CLIENT_VERSION: &str = "claude-desktop-1.24012.9";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_MISSED_POLLS: usize = 2;
 
 pub async fn diagnose(gateway_url: &str, api_key: Option<&str>, online: bool) -> Result<()> {
-    println!("znnz-client Claude Desktop 只读诊断\n");
+    println!("little-mungbean-client Claude Desktop 只读诊断\n");
 
     match registry::status() {
         Ok(status) => {
@@ -83,6 +84,42 @@ pub async fn launch_with_hidden_models(
     mode: ClaudeDesktopModelMode,
     hidden_models: &[String],
 ) -> Result<()> {
+    let api_key = Zeroizing::new(api_key);
+    println!(
+        "{}",
+        i18n::tr(
+            "正在拉取网关模型目录……",
+            "Fetching the gateway model catalog…"
+        )
+    );
+    let catalog = catalog::fetch_catalog(gateway_url, &api_key, DISCOVERY_CLIENT_VERSION).await?;
+    launch_with_catalog(
+        gateway_url,
+        gateway_url,
+        api_key.to_string(),
+        overrides,
+        mode,
+        hidden_models,
+        &catalog,
+    )
+    .await
+}
+
+pub async fn launch_with_catalog(
+    gateway_url: &str,
+    display_gateway_url: &str,
+    api_key: String,
+    overrides: SlotOverrides,
+    mode: ClaudeDesktopModelMode,
+    hidden_models: &[String],
+    catalog: &Value,
+) -> Result<()> {
+    catalog::validate_catalog(catalog).context(i18n::tr(
+        "网关模型目录尚未通过校验",
+        "The gateway model catalog has not passed validation",
+    ))?;
+    // Model/override validation must finish before an existing client is closed.
+    let slots = select_model_slots(catalog, &overrides)?;
     let running = platform::running_claude_desktop_processes()?;
     if !running.is_empty() {
         crate::desktop::close_for_gateway_attach(crate::gui_worker::ClientTarget::ClaudeDesktop)
@@ -103,8 +140,8 @@ pub async fn launch_with_hidden_models(
         println!(
             "{}",
             i18n::tr(
-                "检测到上次异常退出遗留的加密备份，已先恢复原 Claude Desktop 注册表配置。",
-                "Recovered the original Claude Desktop registry settings from a backup left by an earlier abnormal exit."
+                "检测到上次异常退出遗留的加密备份，已先恢复原 Claude Desktop 配置。",
+                "Recovered the original Claude Desktop settings from a backup left by an earlier abnormal exit."
             )
         );
     }
@@ -115,68 +152,11 @@ pub async fn launch_with_hidden_models(
     registry::clear_stale_gateway_policy()?;
 
     let api_key = Zeroizing::new(api_key);
-    println!(
-        "{}",
-        i18n::tr(
-            "正在拉取网关模型目录……",
-            "Fetching the gateway model catalog…"
-        )
-    );
-    let catalog = catalog::fetch_catalog(gateway_url, &api_key, DISCOVERY_CLIENT_VERSION).await?;
-    let slots = select_model_slots(&catalog, &overrides)?;
     let menu = match mode {
-        ClaudeDesktopModelMode::FourSlots => {
-            println!(
-                "{}",
-                i18n::tr(
-                    "Claude Desktop 将使用以下四个兼容模型槽位:",
-                    "Claude Desktop will use these four compatible model slots:"
-                )
-            );
-            print_slots(&slots);
-            DesktopModelMenu::four_slots()
-        }
+        ClaudeDesktopModelMode::FourSlots => DesktopModelMenu::four_slots(),
         ClaudeDesktopModelMode::FullCatalog => {
             let gateway = crate::gateway::GatewayIdentity::parse(gateway_url)?;
-            let menu = DesktopModelMenu::full_catalog_with_source(
-                &catalog,
-                &slots,
-                gateway.source_label(),
-            )?;
-            println!(
-                "{} {} {}",
-                i18n::tr(
-                    "Claude Desktop 将使用完整网关模型列表：",
-                    "Claude Desktop will use the full gateway catalog:"
-                ),
-                menu.model_count(),
-                i18n::tr("个模型（实验模式）。", "models (experimental).")
-            );
-            println!(
-                "{}",
-                i18n::tr(
-                    "Claude 族默认槽位映射:",
-                    "Default Claude-family slot mapping:"
-                )
-            );
-            print_slots(&slots);
-            println!(
-                "{}",
-                i18n::tr(
-                    "提示：图片、视频等非文本模型虽然会列出，但可能不适用于 Claude 聊天界面。",
-                    "Note: image, video, and other non-text models may be listed but might not work in the Claude chat interface."
-                )
-            );
-            if let Some(default_model) = menu.default_model_name() {
-                if i18n::language() == i18n::Language::ZhCn {
-                    println!("完整列表默认模型:     {default_model}（优先 Claude 自家模型）");
-                } else {
-                    println!(
-                        "Full-catalog default model: {default_model} (prefers Claude-family models)"
-                    );
-                }
-            }
-            menu
+            DesktopModelMenu::full_catalog_with_source(catalog, &slots, gateway.source_label())?
         }
     };
     let inference_models = menu
@@ -186,34 +166,6 @@ pub async fn launch_with_hidden_models(
         ClaudeDesktopModelMode::FourSlots => None,
         ClaudeDesktopModelMode::FullCatalog => Some(false),
     };
-    if menu.mode() == ClaudeDesktopModelMode::FullCatalog {
-        if i18n::language() == i18n::Language::ZhCn {
-            println!(
-                "完整列表兼容层:     {} 个模型使用稳定的 Claude 路由 ID，界面仍显示网关原始模型名。",
-                menu.aliased_model_count()
-            );
-            println!(
-                "注册表模型格式:     对象数组，{} 个条目，{} 字节。",
-                menu.model_count(),
-                inference_models.len()
-            );
-            println!("模型发现设置:       关闭；使用固定列表，同时本地 /v1/models 提供同一目录。");
-        } else {
-            println!(
-                "Full-catalog compatibility: {} model(s) use stable Claude route IDs while the UI keeps the original gateway model names.",
-                menu.aliased_model_count()
-            );
-            println!(
-                "Registry model format: object array, {} entries, {} bytes.",
-                menu.model_count(),
-                inference_models.len()
-            );
-            println!(
-                "Model discovery: disabled; using a fixed list also served by local /v1/models."
-            );
-        }
-    }
-
     let proxy = ClaudeDesktopProxy::start(gateway_url, api_key.to_string(), slots, menu).await?;
     registry::capture_and_store()?;
     if let Err(error) = registry::write_temporary_gateway(
@@ -226,7 +178,7 @@ pub async fn launch_with_hidden_models(
         proxy.stop().await;
         if let Err(restore_error) = restore {
             return Err(error).context(format!(
-                "写入临时 Claude Desktop 配置失败，且恢复原注册表也失败: {restore_error:#}"
+                "写入临时 Claude Desktop 配置失败，且恢复原配置也失败: {restore_error:#}"
             ));
         }
         return Err(error);
@@ -241,34 +193,23 @@ pub async fn launch_with_hidden_models(
         proxy.stop().await;
         if let Err(restore_error) = restore {
             return Err(error).context(format!(
-                "Claude Desktop 网关策略校验失败，且恢复原注册表也失败: {restore_error:#}"
+                "Claude Desktop 网关策略校验失败，且恢复原配置也失败: {restore_error:#}"
             ));
         }
         return Err(error);
     }
 
-    println!(
-        "{}",
-        i18n::tr(
-            "已创建当前 Windows 用户专用的加密注册表备份。",
-            "Created an encrypted registry backup for the current Windows user."
-        )
-    );
-    println!(
-        "{}:       {}{}",
-        i18n::tr("本地安全代理", "Local secure proxy"),
-        proxy.base_url(),
-        i18n::tr("（仅监听 127.0.0.1）", " (listens only on 127.0.0.1)")
-    );
-    println!(
-        "{}",
-        i18n::tr(
-            "正在通过本地安全代理启动 Claude Desktop …",
-            "Starting Claude Desktop through the local secure proxy …"
-        )
-    );
-
-    let session_result = run_desktop_session().await.context(i18n::tr(
+    let session_result = run_desktop_session(
+        display_gateway_url,
+        &proxy.base_url(),
+        if mode == ClaudeDesktopModelMode::FullCatalog {
+            crate::gui_worker::ModelListMode::Gateway
+        } else {
+            crate::gui_worker::ModelListMode::BuiltIn
+        },
+    )
+    .await
+    .context(i18n::tr(
         "Claude Desktop • 自动重启 • 失败!",
         "Claude Desktop • Auto-restart • failed!",
     ));
@@ -291,44 +232,42 @@ pub async fn launch_with_hidden_models(
             println!(
                 "{}",
                 i18n::tr(
-                    "Claude Desktop 已退出；本地代理已停止，原注册表配置已恢复。",
-                    "Claude Desktop exited. The local proxy stopped and the original registry settings were restored."
+                    "Claude Desktop 已退出；本地代理已停止，原配置配置已恢复。",
+                    "Claude Desktop exited. The local proxy stopped and the original settings were restored."
                 )
             );
             Ok(())
         }
         (Err(error), Ok(_)) => Err(error),
-        (Ok(()), Err(restore_error)) => Err(restore_error).context(
-            "Claude Desktop 已退出，但原注册表配置恢复失败；请运行 claude-desktop restore",
-        ),
+        (Ok(()), Err(restore_error)) => Err(restore_error)
+            .context("Claude Desktop 已退出，但原配置配置恢复失败；请运行 claude-desktop restore"),
         (Err(error), Err(restore_error)) => Err(error).context(format!(
-            "同时无法恢复原注册表配置: {restore_error:#}。请运行 claude-desktop restore"
+            "同时无法恢复原配置配置: {restore_error:#}。请运行 claude-desktop restore"
         )),
     }
 }
 
 pub fn restore() -> Result<()> {
     if !platform::running_claude_desktop_processes()?.is_empty() {
-        bail!("Claude Desktop 仍在运行。请先从托盘退出，再恢复注册表配置。");
+        bail!("Claude Desktop 仍在运行。请先从托盘退出，再恢复配置配置。");
     }
     if registry::restore_pending()? {
-        println!("已恢复 Claude Desktop 原注册表配置，并删除加密备份。");
+        println!("已恢复 Claude Desktop 原配置配置，并删除加密备份。");
     } else {
         println!("没有检测到待恢复的 Claude Desktop 注册表备份。");
     }
     Ok(())
 }
 
-async fn run_desktop_session() -> Result<()> {
-    let activation_pid = platform::activate_store_claude().await?;
-    println!(
-        "{}",
-        if i18n::language() == i18n::Language::ZhCn {
-            format!("已启动 Claude Desktop（Microsoft Store 版激活 PID {activation_pid}）。")
-        } else {
-            format!("Claude Desktop started (Microsoft Store activation PID {activation_pid}).")
-        }
-    );
+async fn run_desktop_session(
+    display_gateway_url: &str,
+    listening_address: &str,
+    model_list_mode: crate::gui_worker::ModelListMode,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let _activation_pid = platform::activate_claude_gateway().await?;
+    #[cfg(not(target_os = "macos"))]
+    let _activation_pid = platform::activate_store_claude().await?;
 
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     loop {
@@ -338,21 +277,34 @@ async fn run_desktop_session() -> Result<()> {
             crate::local_gateway::confirm_current_worker(
                 crate::gui_worker::ClientTarget::ClaudeDesktop,
             )?;
-            let pids = pids
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let pid = pids.first().copied().unwrap_or_default();
             println!(
                 "{}",
-                if i18n::language() == i18n::Language::ZhCn {
-                    format!("已检测到 Claude Desktop 进程（PID: {pids}）。本地代理正在运行。")
-                } else {
-                    format!(
-                        "Detected Claude Desktop process(es) (PID: {pids}). The local proxy is running."
-                    )
-                }
+                crate::gui_worker::client_started_message(
+                    crate::gui_worker::ClientTarget::ClaudeDesktop,
+                    pid,
+                    display_gateway_url,
+                    model_list_mode,
+                )
             );
+            println!(
+                "{}",
+                i18n::tr(
+                    "Claude Desktop 已自动接入 Little Mungbean 本地网关。",
+                    "Claude Desktop is connected to the Little Mungbean local gateway."
+                )
+            );
+            println!(
+                "{}：{}",
+                i18n::tr("配置目录", "Configuration directory"),
+                registry::configuration_directory()?.display()
+            );
+            println!(
+                "{}：{}",
+                i18n::tr("监听地址", "Listening address"),
+                listening_address
+            );
+            println!("{}", crate::gui_worker::connection_token_hint());
             break;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -360,12 +312,12 @@ async fn run_desktop_session() -> Result<()> {
                 "{}",
                 if i18n::language() == i18n::Language::ZhCn {
                     format!(
-                        "启动后 {} 秒内未检测到官方 Claude Desktop 进程。已停止启动并将恢复原注册表。",
+                        "启动后 {} 秒内未检测到官方 Claude Desktop 进程。已停止启动并将恢复原配置。",
                         START_TIMEOUT.as_secs()
                     )
                 } else {
                     format!(
-                        "The official Claude Desktop process was not detected within {} seconds after launch. Startup was stopped and the original registry will be restored.",
+                        "The official Claude Desktop process was not detected within {} seconds after launch. Startup was stopped and the original settings will be restored.",
                         START_TIMEOUT.as_secs()
                     )
                 }
@@ -382,8 +334,8 @@ async fn run_desktop_session() -> Result<()> {
                 warn!(
                     "{}",
                     i18n::tr(
-                        "收到 Ctrl+C；本地代理将停止并恢复注册表。仍在运行的 Claude Desktop 需要重新启动后才能继续调用网关。",
-                        "Received Ctrl+C; the local proxy will stop and the registry will be restored. Restart any still-running Claude Desktop instance before using the gateway again."
+                        "收到 Ctrl+C；本地代理将停止并恢复配置。仍在运行的 Claude Desktop 需要重新启动后才能继续调用网关。",
+                        "Received Ctrl+C; the local proxy will stop and the configuration will be restored. Restart any still-running Claude Desktop instance before using the gateway again."
                     )
                 );
                 return Ok(());
@@ -398,7 +350,7 @@ async fn run_desktop_session() -> Result<()> {
                 info!(
                     "{}",
                     i18n::tr(
-                        "Claude Desktop 已退出，正在停止本地代理并恢复注册表",
+                        "Claude Desktop 已退出，正在停止本地代理并恢复配置",
                         "Claude Desktop exited; stopping the local proxy and restoring the registry"
                     )
                 );

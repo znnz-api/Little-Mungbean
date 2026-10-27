@@ -91,7 +91,7 @@ struct GatewayState {
     route: RwLock<Route>,
     client_token: String,
     admin_token: String,
-    client: Client,
+    client: crate::network_proxy::Client,
     direct_client: Client,
     usage: crate::usage::Recorder,
     tool_signatures: Arc<Mutex<crate::tool_signatures::Cache>>,
@@ -181,7 +181,7 @@ pub fn disconnect_for_account(target: ClientTarget) -> Result<()> {
 }
 
 /// Refresh managed attachment flags from the process detector. This covers a
-/// client closed outside Agent-Switch before its worker has emitted cleanup.
+/// client closed outside Little-Mungbean before its worker has emitted cleanup.
 pub fn sync_client_processes(running: &[(ClientTarget, u32)]) {
     let mut routes = managed_routes().lock().unwrap_or_else(|e| e.into_inner());
     for (target, route) in routes.iter_mut() {
@@ -264,11 +264,12 @@ async fn ensure_managed(
         }),
         client_token: info.client_token.clone(),
         admin_token: info.admin_token.clone(),
-        client: crate::network_proxy::configure_reqwest_builder(Client::builder())?
-            .connect_timeout(Duration::from_secs(12))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
+        client: crate::network_proxy::Client::new(|| {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(12))
+                .pool_idle_timeout(Duration::from_secs(30))
+        })?
+        .redirect_limit(0),
         direct_client: Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(12))
@@ -314,16 +315,19 @@ async fn ensure_managed(
 }
 
 pub fn state_path(target: ClientTarget) -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let root = crate::platform_paths::data_root()?;
+    #[cfg(not(target_os = "macos"))]
     let root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))
         .context("无法确定本地应用数据目录")?
-        .join("Agent-Switch")
-        .join(if crate::background::is_managed() {
-            "gateway-v3"
-        } else {
-            "gateway-v2"
-        });
+        .join("Little-Mungbean");
+    let root = root.join(if crate::background::is_managed() {
+        "gateway-v3"
+    } else {
+        "gateway-v2"
+    });
     fs::create_dir_all(&root)
         .with_context(|| format!("无法创建本地网关状态目录 {}", root.display()))?;
     Ok(root.join(format!("{}.json", target.id())))
@@ -385,7 +389,7 @@ pub async fn ensure_and_update(
         return ensure_managed(target, &gateway_url, api_key, conversion_enabled).await;
     }
     let _lock = crate::platform::try_acquire_named_mutex(&format!(
-        r"Local\Agent-Switch-gateway-{}",
+        r"Local\Little-Mungbean-gateway-{}",
         target.id()
     ))?
     .context("本地网关正在更新，请稍后重试")?;
@@ -411,11 +415,15 @@ pub fn attached_gateway_url(target: ClientTarget) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
+pub fn connection_details(target: ClientTarget) -> Result<Option<(String, String)>> {
+    Ok(read_info(target)?.map(|info| (info.base_url, info.client_token)))
+}
+
 /// Compare the route actually applied by the worker without retaining another plaintext key.
 pub fn configuration_fingerprint(gateway_url: &str, api_key: &str) -> Result<String> {
     let url = normalize_url(gateway_url)?;
     let mut digest = Sha256::new();
-    digest.update(b"Agent-Switch-route-v1\0");
+    digest.update(b"Little-Mungbean-route-v1\0");
     digest.update(url.as_str().trim_end_matches('/').as_bytes());
     digest.update([0]);
     digest.update(api_key.trim().as_bytes());
@@ -475,6 +483,7 @@ pub fn confirm_current_worker(target: ClientTarget) -> Result<()> {
         let mut routes = managed_routes().lock().unwrap_or_else(|e| e.into_inner());
         let route = routes.get_mut(&target).context("常驻本地网关状态不存在")?;
         route.attached = true;
+        crate::background::confirm_client_ready(target);
         return Ok(());
     }
     let managed = crate::runtime_state::load_active_states()?
@@ -531,7 +540,7 @@ pub async fn update_attached(
         return Ok(());
     }
     let _lock = crate::platform::try_acquire_named_mutex(&format!(
-        r"Local\Agent-Switch-gateway-{}",
+        r"Local\Little-Mungbean-gateway-{}",
         target.id()
     ))?
     .context("本地网关正在更新，请稍后重试")?;
@@ -720,11 +729,12 @@ pub async fn run_daemon() -> Result<()> {
         route: RwLock::new(route),
         client_token: info.client_token.clone(),
         admin_token: info.admin_token.clone(),
-        client: crate::network_proxy::configure_reqwest_builder(Client::builder())?
-            .connect_timeout(Duration::from_secs(12))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
+        client: crate::network_proxy::Client::new(|| {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(12))
+                .pool_idle_timeout(Duration::from_secs(30))
+        })?
+        .redirect_limit(0),
         direct_client: Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(12))
@@ -818,6 +828,8 @@ async fn handle_request(
         } else {
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "route_update_failed");
         }
+        #[cfg(target_os = "macos")]
+        crate::network_proxy::refresh_macos_pac();
         return json_response(StatusCode::OK, json!({"ok": true}));
     }
     if !authorized(request.headers(), &state.client_token) {
@@ -859,9 +871,9 @@ async fn forward(
         target.host_str(),
         Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
     ) {
-        &state.direct_client
+        crate::network_proxy::Client::direct(state.direct_client.clone())
     } else {
-        &state.client
+        state.client.clone()
     };
     let bytes = Limited::new(body, MAX_REQUEST_BODY)
         .collect()
@@ -1066,7 +1078,7 @@ async fn forward(
         // menus. Preserve the upstream URL so those menus do not display the
         // loopback gateway address as their provider source.
         if let Ok(value) = HeaderValue::from_str(upstream_base.as_str()) {
-            headers_out.insert(HeaderName::from_static("x-agent-switch-upstream"), value);
+            headers_out.insert(HeaderName::from_static("x-little-mungbean-upstream"), value);
         }
     }
     if let Some(usage) = request_usage.as_mut() {
@@ -1426,7 +1438,7 @@ fn aggregate_stream_events(
                             return None;
                         }
                         while tool_calls.len() <= index {
-                            tool_calls.push(json!({"id":"call_agent_switch","type":"function","function":{"name":"","arguments":""}}));
+                            tool_calls.push(json!({"id":"call_little_mungbean","type":"function","function":{"name":"","arguments":""}}));
                         }
                         let call = &mut tool_calls[index];
                         if let Some(id) = delta.get("id") {
@@ -1584,7 +1596,7 @@ fn format_converted_sse(body: &[u8], protocol: crate::protocol::WireProtocol) ->
     let id = value
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or("agent-switch-converted");
+        .unwrap_or("little-mungbean-converted");
     let model = value
         .get("model")
         .cloned()
@@ -1637,7 +1649,7 @@ fn format_converted_sse(body: &[u8], protocol: crate::protocol::WireProtocol) ->
             for (index, block) in blocks.iter().enumerate() {
                 match block.get("type").and_then(Value::as_str) {
                     Some("tool_use") => {
-                        let block_start = json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":block.get("id").cloned().unwrap_or_else(||json!("call_agent_switch")),"name":block.get("name").cloned().unwrap_or(Value::Null),"input":{}}});
+                        let block_start = json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":block.get("id").cloned().unwrap_or_else(||json!("call_little_mungbean")),"name":block.get("name").cloned().unwrap_or(Value::Null),"input":{}}});
                         let partial_json =
                             serde_json::to_string(block.get("input").unwrap_or(&Value::Null))
                                 .unwrap_or_else(|_| "{}".into());
@@ -2093,7 +2105,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_converted_stream_releases_request_and_records_cancellation() {
         let root = std::env::temp_dir().join(format!(
-            "agent-switch-cancel-{:032x}",
+            "little-mungbean-cancel-{:032x}",
             rand::random::<u128>()
         ));
         fs::create_dir_all(&root).unwrap();
@@ -2226,9 +2238,174 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires an explicitly supplied Claude Code executable; isolated loopback-only gateway picker test"]
+    async fn installed_claude_gateway_picker_rotates_settings_credentials() {
+        use crate::claude_desktop_proxy::{ClaudeDesktopProxy, DesktopModelMenu, ModelSlots};
+        let executable = std::env::var_os("LITTLE_MUNGBEAN_CLAUDE_TEST_EXE")
+            .expect("supply the Claude Code executable path explicitly");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = seen.clone();
+        let upstream = serve(move |request| {
+            let captured = captured.clone();
+            async move {
+                if request.uri().path().ends_with("/count_tokens") {
+                    return json_response(StatusCode::OK, json!({"input_tokens":10}));
+                }
+                assert_eq!(request.uri().path(), "/v1/chat/completions");
+                let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                let model = body["model"].as_str().unwrap().to_owned();
+                captured.lock().unwrap().push(model.clone());
+                if body["stream"] != true {
+                    return json_response(StatusCode::OK, json!({
+                        "id":"probe", "model":model,
+                        "choices":[{"index":0,"message":{"role":"assistant","content":"."},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":1,"completion_tokens":1}
+                    }));
+                }
+                let bytes = Bytes::from(format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"id":"chat-picker", "model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":"PICKER_OK"},"finish_reason":null}]}),
+                    json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}})));
+                Response::builder().header(CONTENT_TYPE, "text/event-stream")
+                    .body(Full::new(bytes).map_err(|never| match never {}).boxed_unsync()).unwrap()
+            }
+        }).await;
+        let gateway = test_gateway(&format!("{}/v1", upstream.url)).await;
+        let client = Client::builder().no_proxy().build().unwrap();
+        client.post(format!("{}/admin/update", gateway.url)).bearer_auth("admin-token")
+            .json(&json!({"gateway_url":format!("{}/v1", upstream.url),"api_key":"first-key","conversion_enabled":true}))
+            .send().await.unwrap().error_for_status().unwrap();
+        let catalog =
+            json!({"models":[{"slug":"gpt-6-luna","visibility":"list","supported_in_api":true}]});
+        let menu = DesktopModelMenu::claude_code_catalog(&catalog, "From isolated test").unwrap();
+        let picker = menu.claude_code_model_picker();
+        let alias = picker["options"][0]["model"].as_str().unwrap();
+        let slots = ModelSlots {
+            haiku: "gpt-6-luna".into(),
+            sonnet: "gpt-6-luna".into(),
+            opus: "gpt-6-luna".into(),
+            fable: "gpt-6-luna".into(),
+        };
+        let proxy = ClaudeDesktopProxy::start(&gateway.url, "client-token".into(), slots, menu)
+            .await
+            .unwrap();
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/qa")
+            .join(format!("claude-picker-{:032x}", rand::random::<u128>()));
+        fs::create_dir_all(&root).unwrap();
+        let settings_path = root.join("settings.json");
+        // Old settings must reproduce a pre-main-gateway rejection even though
+        // the launcher has supplied the new credential. Then rotate settings.
+        for stale in [true, false] {
+            let token = if stale {
+                "stale-isolated-token"
+            } else {
+                proxy.local_token()
+            };
+            let settings = json!({"modelPicker":picker,"env":{
+                "ANTHROPIC_BASE_URL":proxy.base_url(), "ANTHROPIC_AUTH_TOKEN":token,
+                "CLAUDE_GATEWAY_ALLOW_LOOPBACK":"1"
+            }});
+            #[cfg(target_os = "macos")]
+            let mut settings = settings;
+            #[cfg(target_os = "macos")]
+            for (name, value) in crate::platform::CLAUDE_GATEWAY_MODEL_POLICY {
+                settings["env"][name] = json!(value);
+            }
+            fs::write(
+                &settings_path,
+                serde_json::to_vec_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+            let mut command = tokio::process::Command::new(&executable);
+            command
+                .env_clear()
+                .env("HOME", &root)
+                .env("PATH", "/opt/homebrew/bin:/usr/bin:/bin")
+                .env("CLAUDE_CONFIG_DIR", root.join("config"))
+                .env("ANTHROPIC_BASE_URL", proxy.base_url())
+                .env("ANTHROPIC_AUTH_TOKEN", proxy.local_token())
+                .env("NO_PROXY", "127.0.0.1,localhost,::1")
+                .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+                .env("DISABLE_AUTOUPDATER", "1")
+                .env("DISABLE_TELEMETRY", "1")
+                .env("DISABLE_ERROR_REPORTING", "1")
+                .args([
+                    "--bare",
+                    "--print",
+                    "--no-session-persistence",
+                    "--strict-mcp-config",
+                    "--setting-sources",
+                    "",
+                    "--tools",
+                    "",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--model",
+                    alias,
+                    "Reply PICKER_OK.",
+                ])
+                .arg("--settings")
+                .arg(&settings_path)
+                .current_dir(&root)
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(35), command.output())
+                .await
+                .expect("isolated Claude picker test timed out")
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stale {
+                assert!(
+                    !output.status.success(),
+                    "stale settings unexpectedly succeeded: {stdout}"
+                );
+                assert!(
+                    seen.lock().unwrap().is_empty(),
+                    "rejected credentials reached the upstream"
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "fresh settings: {stdout}\n{stderr}"
+                );
+                let result = stdout
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find(|event| event["type"] == "result")
+                    .expect("no Claude result");
+                assert_eq!(result["result"], "PICKER_OK", "{stdout}");
+                assert!(!seen.lock().unwrap().is_empty());
+                assert!(
+                    seen.lock()
+                        .unwrap()
+                        .iter()
+                        .all(|model| model == "gpt-6-luna")
+                );
+                let (recorder, path) = gateway.statistics.as_ref().unwrap();
+                recorder.flush();
+                assert!(
+                    crate::usage::load_summaries(path)
+                        .unwrap()
+                        .values()
+                        .any(|summary| summary.success > 0)
+                );
+            }
+            eprintln!(
+                "isolated gateway picker: stale={stale}, exit={:?}",
+                output.status.code()
+            );
+        }
+        proxy.stop().await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires an explicitly supplied Claude Code executable; isolated loopback-only smoke test"]
     async fn installed_claude_code_displays_converted_stream() {
-        let executable = std::env::var_os("AGENT_SWITCH_CLAUDE_TEST_EXE")
+        let executable = std::env::var_os("LITTLE_MUNGBEAN_CLAUDE_TEST_EXE")
             .expect("supply the Claude Code executable path explicitly");
         let upstream = serve(|request| async move {
             if request.uri().path().ends_with("/count_tokens") {
@@ -2397,7 +2574,7 @@ mod tests {
 
     async fn test_gateway(upstream: &str) -> TestServer {
         let path = std::env::temp_dir().join(format!(
-            "agent-switch-gateway-test-{:032x}.sqlite",
+            "little-mungbean-gateway-test-{:032x}.sqlite",
             rand::random::<u128>()
         ));
         let recorder = crate::usage::Recorder::open(&path).unwrap();
@@ -2415,7 +2592,8 @@ mod tests {
             client: Client::builder()
                 .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
                 .build()
-                .unwrap(),
+                .unwrap()
+                .into(),
             direct_client: Client::builder().no_proxy().build().unwrap(),
             usage: recorder.clone(),
             tool_signatures: Arc::default(),
@@ -2434,9 +2612,11 @@ mod tests {
     fn managed_host_routes_reopen_streaming_exit_and_cleanup() {
         // Global host and app-data isolation must run in a separate test process:
         // never overwrite real gateway state or alter other parallel tests.
-        if std::env::var_os("AGENT_SWITCH_ISOLATED_HOST_TEST").is_none() {
-            let root = std::env::temp_dir()
-                .join(format!("agent-switch-host-{:032x}", rand::random::<u128>()));
+        if std::env::var_os("LITTLE_MUNGBEAN_ISOLATED_HOST_TEST").is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "little-mungbean-host-{:032x}",
+                rand::random::<u128>()
+            ));
             fs::create_dir_all(&root).unwrap();
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -2444,7 +2624,7 @@ mod tests {
                     "local_gateway::tests::managed_host_routes_reopen_streaming_exit_and_cleanup",
                     "--nocapture",
                 ])
-                .env("AGENT_SWITCH_ISOLATED_HOST_TEST", "1")
+                .env("LITTLE_MUNGBEAN_ISOLATED_HOST_TEST", "1")
                 .env("LOCALAPPDATA", &root)
                 .output()
                 .unwrap();
@@ -2885,7 +3065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_fetch_does_not_retry_http_server_errors_with_anthropic_headers() {
+    async fn catalog_fetch_retries_one_http_server_error_without_anthropic_headers() {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
         let upstream = serve(move |_| {
@@ -2898,7 +3078,97 @@ mod tests {
         .await;
         let result = crate::catalog::fetch_catalog(&upstream.url, "first-key", "0.145.0").await;
         assert!(result.unwrap_err().to_string().contains("HTTP 502"));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn every_client_start_aborts_with_actionable_error_after_two_failed_attempts() {
+        for target in ClientTarget::ALL {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let upstream = serve(move |_| {
+                let calls = observed.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    json_error(StatusCode::BAD_GATEWAY, "upstream_request_failed")
+                }
+            })
+            .await;
+            let error = crate::gui_worker::run(
+                target,
+                &upstream.url,
+                "test-key".to_owned(),
+                crate::gui_worker::ModelListMode::Gateway,
+                true,
+            )
+            .await
+            .unwrap_err();
+            let detail = crate::i18n::runtime_log_error(&error);
+            assert!(detail.contains("未启动或重启客户端"));
+            assert!(detail.contains("HTTP 502"));
+            assert!(detail.contains("网络代理"));
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{}", target.title());
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_fetch_recovers_on_second_attempt_for_every_client() {
+        use crate::gui_worker::ModelListMode;
+
+        for target in ClientTarget::ALL {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let upstream = serve(move |_| {
+                let calls = observed.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        json_error(StatusCode::BAD_GATEWAY, "upstream_request_failed")
+                    } else {
+                        json_response(StatusCode::OK, json!({"data": [{"id": "gpt-test"}]}))
+                    }
+                }
+            })
+            .await;
+            let catalog = crate::gui_worker::fetch_catalog_for_target(
+                target,
+                &upstream.url,
+                "test-key",
+                ModelListMode::BuiltIn,
+            )
+            .await
+            .unwrap();
+            assert_eq!(crate::catalog::visible_slugs(&catalog), ["gpt-test"]);
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{}", target.title());
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_header_fallback_and_http_retry_share_two_attempt_limit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let upstream = serve(move |request| {
+            let calls = observed.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if request.headers().contains_key("anthropic-version") {
+                    json_error(StatusCode::BAD_GATEWAY, "upstream_request_failed")
+                } else {
+                    json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": {
+                            "type": "invalid_request_error",
+                            "message": "anthropic-version: header is required"
+                        }}),
+                    )
+                }
+            }
+        })
+        .await;
+        let error = crate::catalog::fetch_catalog(&upstream.url, "test-key", "0.145.0")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("HTTP 502"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

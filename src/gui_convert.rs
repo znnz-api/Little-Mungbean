@@ -34,10 +34,14 @@ pub fn frames() -> Vec<String> {
             let progress = frame as f64 / (PERIOD * FPS);
             let angle = from + (to - from) * progress;
             let mut svg = SOURCE.to_owned();
-            svg.insert_str(
-                open_end,
-                &format!(" transform=\"rotate({angle:.4} 12 12)\""),
-            );
+            let rotation = format!("rotate({angle:.4} 12 12)");
+            if let Some(transform) = group.attribute_node("transform") {
+                // animateTransform replaces the group's base transform by
+                // default. Replace its value rather than adding a duplicate.
+                svg.replace_range(transform.range_value(), &rotation);
+            } else {
+                svg.insert_str(open_end, &format!(" transform=\"{rotation}\""));
+            }
             svg
         })
         .collect()

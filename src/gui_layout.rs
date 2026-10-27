@@ -60,9 +60,9 @@ pub const WINDOW_BACKGROUND: [u8; 4] = [48, 48, 48, 255];
 // ---------------------------------------------------------------------------
 
 // 区块 1 输入框和右侧操作按钮背景，对应 CSS：rgb(0 0 0 / 33%)。
-pub const INPUT_SURFACE_BG_RED: u8 = 32;
-pub const INPUT_SURFACE_BG_GREEN: u8 = 32;
-pub const INPUT_SURFACE_BG_BLUE: u8 = 32;
+pub const INPUT_SURFACE_BG_RED: u8 = 30;
+pub const INPUT_SURFACE_BG_GREEN: u8 = 30;
+pub const INPUT_SURFACE_BG_BLUE: u8 = 30;
 pub const INPUT_SURFACE_BG_ALPHA: u8 = 255;
 
 // 区块 2 客户端总面板、模型列表选框和状态栏日志按钮背景、“安装客户端”与“启动/重启 • 连接”禁用背景色，对应 CSS：rgb(255 255 255 / 5%)。
@@ -84,22 +84,30 @@ pub const HEADER_LOGO_WIDTH: f32 = 32.0;
 pub const HEADER_LOGO_HEIGHT: f32 = 32.0;
 // Logo 相对标题栏内容区垂直中心的偏移；正数向下，负数向上。
 pub const HEADER_LOGO_OFFSET_Y: f32 = 1.5;
+#[cfg(target_os = "macos")]
+pub const MAC_HEADER_LOGO_OFFSET_Y: f32 = 1.5;
 // Logo 与右侧标题文字之间的横向距离。
-pub const HEADER_LOGO_TITLE_GAP: f32 = 8.0;
+pub const HEADER_LOGO_TITLE_GAP: f32 = 6.0;
 // 主标题字号。
 pub const HEADER_TITLE_MAIN_FONT_SIZE: f32 = 15.0;
 // 主标题行盒高度。
 pub const HEADER_TITLE_MAIN_LINE_HEIGHT: f32 = 19.0;
 // 主标题行盒与副标题行盒之间的垂直距离。
 pub const HEADER_TITLE_LINES_GAP: f32 = 1.0;
+#[cfg(target_os = "macos")]
+pub const MAC_HEADER_TITLE_LINES_GAP: f32 = 1.0;
 // 主副标题文字块相对标题栏内容区垂直中心的偏移；正数向下，负数向上。
-pub const HEADER_TITLE_BLOCK_OFFSET_Y: f32 = -0.0;
+pub const HEADER_TITLE_BLOCK_OFFSET_Y: f32 = 0.0;
+#[cfg(target_os = "macos")]
+pub const MAC_HEADER_TITLE_BLOCK_OFFSET_Y: f32 = 0.3;
 // 副标题行盒高度。
 pub const HEADER_TITLE_SUBTITLE_LINE_HEIGHT: f32 = 14.0;
 // 副标题右侧检查更新、GitHub、Star、Help 链接图标的宽高。
 pub const HEADER_SUBTITLE_ICON_SIZE: f32 = 12.0;
 // 副标题链接图标相对副标题文字垂直中心的偏移；正数向下，负数向上。
-pub const HEADER_SUBTITLE_ICON_OFFSET_Y: f32 = 0.7;
+pub const HEADER_SUBTITLE_ICON_OFFSET_Y: f32 = 0.72;
+#[cfg(target_os = "macos")]
+pub const MAC_HEADER_SUBTITLE_ICON_OFFSET_Y: f32 = 0.72;
 // 标题栏右侧红、黄、绿窗口控制圆点的直径。
 pub const HEADER_TRAFFIC_DOT_SIZE: f32 = 17.0;
 // 标题栏右侧窗口控制圆点之间的间距。
@@ -119,6 +127,9 @@ pub const CONTENT_PADDING_TOP: f32 = 12.0;
 pub const CONTENT_PADDING_RIGHT: f32 = 15.0;
 pub const CONTENT_PADDING_BOTTOM: f32 = 12.0;
 pub const CONTENT_PADDING_LEFT: f32 = 15.0;
+// 内容背景图相对网页参考图保留的上下留白。
+pub const CONTENT_BACKGROUND_MARGIN_TOP: f32 = 5.0;
+pub const CONTENT_BACKGROUND_MARGIN_BOTTOM: f32 = 0.0;
 
 // ---------------------------------------------------------------------------
 // 区块 1：两个输入框 + 两个操作按钮
@@ -162,22 +173,30 @@ pub const PROVIDER_CORNER_RADIUS: u8 = 12;
 // 预设卡片背景透明；描边沿用历史配置下拉菜单的 1px 内描边。
 pub const PROVIDER_BACKGROUND: [u8; 3] = [0, 0, 0];
 pub const PROVIDER_BACKGROUND_ALPHA: u8 = 0;
-// Hover outline for provider preset cards: rgb(20 126 255 / 33%).
-pub const PROVIDER_HOVER_OUTLINE: [u8; 4] = [20, 126, 255, 84];
-pub const PROVIDER_TOP_GAP: f32 = 5.0;
+// Hover outline/background for provider preset cards: 50% / 15% opacity.
+pub const PROVIDER_HOVER_OUTLINE: [u8; 4] = [20, 126, 255, 128];
+pub const PROVIDER_HOVER_BACKGROUND: [u8; 4] = [71, 160, 255, 38];
 // 提供商预设图标采用固定间距；每行最多 7 个，超出后换行。
 pub const PROVIDER_MAX_COLUMNS: usize = 7;
 pub const PROVIDER_BUTTON_GAP: f32 = 8.0;
 pub const PROVIDER_ROW_GAP: f32 = 8.0;
+pub const ABOUT_SPONSOR_MAX_COLUMNS: usize = 8;
 pub const PROVIDER_TITLE_FONT_SIZE: f32 = 11.0;
 pub const PROVIDER_TITLE_HEIGHT: f32 = 16.0;
-pub const PROVIDER_TITLE_LINE_COLOR: [u8; 4] = [22, 22, 22, 255];
+// MCP 与提供商菜单的标题线沿用网页 CSS：两侧各 52px、间隔 8px。
+pub const SECTION_TITLE_LINE_COLOR: [u8; 4] = [76, 76, 76, 255];
+pub const SECTION_TITLE_LINE_LENGTH: f32 = 52.0;
+pub const SECTION_TITLE_LINE_GAP: f32 = 8.0;
+pub const SECTION_TITLE_LINE_WIDTH: f32 = 0.5;
 // 两个提供商标题两侧的固定线段长度。
-pub const PROVIDER_RECORDS_TITLE_LINE_LENGTH: f32 = 52.0;
-pub const PROVIDER_PRESET_TITLE_LINE_LENGTH: f32 = 52.0;
-// 两个标题各自独立控制标题与下面内容之间的距离。
-pub const PROVIDER_RECORDS_TITLE_BOTTOM_GAP: f32 = 5.0;
-pub const PROVIDER_PRESET_TITLE_BOTTOM_GAP: f32 = 5.0;
+pub const PROVIDER_RECORDS_TITLE_LINE_LENGTH: f32 = SECTION_TITLE_LINE_LENGTH;
+pub const PROVIDER_PRESET_TITLE_LINE_LENGTH: f32 = SECTION_TITLE_LINE_LENGTH;
+// 两个提供商标题各自独立控制标题与上方内容之间的距离。
+pub const PROVIDER_RECORDS_TITLE_TOP_GAP: f32 = 3.0;
+pub const PROVIDER_PRESET_TITLE_TOP_GAP: f32 = 3.0;
+// 两个提供商标题各自独立控制标题与下面内容之间的距离。
+pub const PROVIDER_RECORDS_TITLE_BOTTOM_GAP: f32 = 3.0;
+pub const PROVIDER_PRESET_TITLE_BOTTOM_GAP: f32 = 3.0;
 
 // 输入框右侧展开/显示隐藏按钮的悬停背景。
 pub const INPUT_INLINE_BUTTON_SIZE: f32 = 26.0;
@@ -186,18 +205,18 @@ pub const INPUT_INLINE_BUTTON_HOVER_RED: u8 = 48;
 pub const INPUT_INLINE_BUTTON_HOVER_GREEN: u8 = 48;
 pub const INPUT_INLINE_BUTTON_HOVER_BLUE: u8 = 48;
 
-// 提供商记录列表背景与选项悬停/选中背景。
-pub const HISTORY_BG_RED: u8 = 48;
-pub const HISTORY_BG_GREEN: u8 = 48;
-pub const HISTORY_BG_BLUE: u8 = 48;
+// 提供商记录列表背景。
+pub const HISTORY_BG_RED: u8 = 43;
+pub const HISTORY_BG_GREEN: u8 = 43;
+pub const HISTORY_BG_BLUE: u8 = 43;
 pub const HISTORY_BG_ALPHA: u8 = 255;
 // 提供商记录列表选项默认背景。
-pub const HISTORY_ITEM_BG_RED: u8 = 32;
-pub const HISTORY_ITEM_BG_GREEN: u8 = 32;
-pub const HISTORY_ITEM_BG_BLUE: u8 = 32;
+pub const HISTORY_ITEM_BG_RED: u8 = 30;
+pub const HISTORY_ITEM_BG_GREEN: u8 = 30;
+pub const HISTORY_ITEM_BG_BLUE: u8 = 30;
 pub const HISTORY_ITEM_BG_ALPHA: u8 = 255;
 // 提供商记录列表选项悬停/选中背景/文字颜色。
-pub const HISTORY_ITEM_ACTIVE: [u8; 4] = [16, 38, 77, 255];
+pub const HISTORY_ITEM_ACTIVE: [u8; 4] = [35, 47, 116, 255];
 pub const HISTORY_ITEM_ACTIVE_TEXT: [u8; 3] = [71, 160, 255];
 // 提供商记录列表选项重命名时背景/外边线。
 pub const HISTORY_EDIT_BG: u8 = 12;
@@ -297,6 +316,8 @@ pub const CLIENT_CARD_HORIZONTAL_GAP: f32 = 12.0;
 pub const CLIENT_SELECTED_NOTCH_WIDTH: f32 = 16.0;
 // 被选中客户端卡片在区块 2-1 底部显示的缺口高度。
 pub const CLIENT_SELECTED_NOTCH_HEIGHT: f32 = 4.0;
+// 与网页 transition: transform .24s cubic-bezier(.2, .8, .2, 1) 一致。
+pub const CLIENT_SELECTION_TRANSITION_SECONDS: f32 = 0.24;
 
 // ---------------------------------------------------------------------------
 // 区块 2-2：模型列表选择 + 启动按钮
@@ -304,23 +325,9 @@ pub const CLIENT_SELECTED_NOTCH_HEIGHT: f32 = 4.0;
 
 // 区块 2-1 客户端卡片整体与区块 2-2 操作行之间的竖向距离。
 pub const CLIENT_CARDS_ACTIONS_VERTICAL_GAP: f32 = 12.0;
-// 区块 2-2 中，模型列表选择按钮之间的横向距离。
-pub const MODEL_CHIP_HORIZONTAL_GAP: f32 = 10.0;
-// 区块 2-2 中，模型列表选择按钮的高度。
-pub const MODEL_CHIP_HEIGHT: f32 = 34.0;
-// 模型列表选择按钮的左内边距。
-pub const MODEL_CHIP_PADDING_LEFT: f32 = 8.0;
-// 模型列表选择按钮的右内边距。
-pub const MODEL_CHIP_PADDING_RIGHT: f32 = 8.0;
-// 模型列表选择按钮前方勾选区域的宽度。
-pub const MODEL_CHECK_WIDTH: f32 = 16.0;
-// 模型列表选择按钮前方勾选区域的高度。
-pub const MODEL_CHECK_HEIGHT: f32 = 16.0;
-// 前方勾选区域与右侧模型列表文字之间的横向距离。
-pub const MODEL_CHECK_TEXT_GAP: f32 = 6.0;
 // 区块 2-2 中，启动按钮的宽度和高度。
 pub const MODEL_INSTALL_SIZE: f32 = 34.0;
-// 安装按钮与启动按钮之间的距离。
+// 操作行右侧三个图标按钮之间的距离。
 pub const MODEL_INSTALL_LAUNCH_GAP: f32 = 10.0;
 // 安装图标的宽度和高度。
 pub const MODEL_INSTALL_ICON_WIDTH: f32 = 16.0;
@@ -364,6 +371,8 @@ pub const LOG_MENU_BUTTON_RADIUS: u8 = 8;
 pub const LOG_MENU_BUTTON_GAP: f32 = 4.0;
 pub const LOG_MENU_BUTTON_BG: [u8; 3] = [59, 59, 59];
 pub const LOG_MENU_BUTTON_FONT_SIZE: f32 = 11.0;
+// 日志内容右键菜单沿用日志悬停菜单的样式，但使用更窄的宽度。
+pub const LOG_COPY_MENU_WIDTH: f32 = 78.0;
 
 // 日志浮动窗口的固定高度。
 pub const LOG_WINDOW_HEIGHT: f32 = 317.0;
@@ -372,17 +381,35 @@ pub const LOG_WINDOW_MARGIN: f32 = 10.0;
 // 日志浮动窗口标题文字字号。
 pub const LOG_WINDOW_TITLE_FONT_SIZE: f32 = HEADER_TITLE_MAIN_FONT_SIZE;
 // 日志窗口分别绘制标题栏和内容栏背景。
-pub const LOG_HEADER_BG: [u8; 3] = [48, 48, 48];
+pub const LOG_HEADER_BG: [u8; 3] = [43, 43, 43];
 pub const LOG_CONTENT_BG: [u8; 3] = [2, 7, 33];
 pub const LOG_CONTENT_TEXT: [u8; 3] = [200, 206, 216];
 pub const LOG_HEADER_HEIGHT: f32 = INPUT_INLINE_BUTTON_SIZE;
 pub const LOG_HEADER_PADDING_BOTTOM: f32 = 10.0;
-pub const LOG_CLOSE_BUTTON_SIZE: f32 = 24.0;
-pub const LOG_CLOSE_BUTTON_RADIUS: u8 = 9;
-pub const LOG_CLOSE_ICON_SIZE: f32 = 7.0;
-pub const LOG_CLOSE_ICON_STROKE: f32 = 2.0;
-pub const LOG_CLOSE_HOVER_BG: [u8; 3] = [201, 0, 0];
-pub const LOG_CLOSE_BG: [u8; 3] = [60, 60, 60];
+// MCP/日志窗口共用左侧返回箭头。
+pub const PANEL_BACK_SIZE: f32 = 22.0;
+pub const MCP_PANEL_PADDING: f32 = 10.0;
+pub const MCP_PANEL_RADIUS: u8 = 12;
+// MCP 与 Skills 面板顶部向上扩展，底部仍与日志按钮保持原有间距。
+pub const MCP_PANEL_TOP_OFFSET: f32 = -15.0;
+pub const MCP_TOOLBAR_CONTROL_HEIGHT: f32 = 26.0;
+pub const MCP_STATUS_BUTTON_GAP: f32 = 2.0;
+pub const MCP_CARD_HEIGHT: f32 = 44.0;
+pub const MCP_CARD_PADDING: f32 = 8.0;
+pub const MCP_CARD_TEXT_GAP: f32 = 7.0;
+pub const MCP_LOCAL_CARD_BOTTOM_EXTRA: f32 = 2.0;
+pub const MCP_TARGET_HEIGHT: f32 = 28.0;
+pub const MCP_TARGET_GAP: f32 = 6.0;
+pub const MCP_INPUT_FONT_SIZE: f32 = 12.0;
+pub const MCP_SEARCH_WIDTH: f32 = 175.0;
+pub const MCP_SEARCH_HEIGHT: f32 = 22.0;
+pub const MCP_SEARCH_FONT_SIZE: f32 = 10.0;
+pub const MCP_SEARCH_RIGHT: f32 = 24.0;
+pub const MCP_FORM_HELP_BG: [u8; 3] = [58, 37, 30];
+pub const MCP_FORM_HELP_PADDING: i8 = 10;
+pub const MCP_FORM_HELP_RADIUS: u8 = 10;
+pub const MODEL_SOURCE_MENU_WIDTH: f32 = 124.0;
+pub const MODEL_SOURCE_GATEWAY_BG: [u8; 3] = [19, 152, 86];
 pub const LOG_WINDOW_CORNER_RADIUS: u8 = 14;
 // 日志正文的行高，略高于默认字体行高以便区分相邻记录。
 pub const LOG_CONTENT_LINE_HEIGHT: f32 = 16.0;
@@ -392,6 +419,8 @@ pub const MODEL_LOG_EVEN_ROW_COLOR: [u8; 3] = [112, 211, 255];
 pub const TOOLTIP_DELAY_SECONDS: f32 = 0.12;
 // 鼠标悬停提示与目标元素之间的距离。
 pub const TOOLTIP_GAP: f32 = 6.0;
+// 悬停提示与主窗口左右边缘之间保留的最小距离。
+pub const TOOLTIP_WINDOW_SIDE_MARGIN: f32 = 8.0;
 // 鼠标悬停提示底部居中倒三角箭头的宽度。
 pub const TOOLTIP_ARROW_WIDTH: f32 = 10.0;
 // 鼠标悬停提示底部居中倒三角箭头的高度。
@@ -405,14 +434,37 @@ pub const TOOLTIP_CONTENT_MIN_HEIGHT: f32 = 18.0;
 // 鼠标悬停提示内部的水平与竖直边距。
 pub const TOOLTIP_PADDING_HORIZONTAL: i8 = 8;
 pub const TOOLTIP_PADDING_VERTICAL: i8 = 5;
+// macOS 客户端卡片两行提示之间的额外间距。
+#[cfg(target_os = "macos")]
+pub const MAC_CLIENT_TOOLTIP_LINES_GAP: f32 = 1.0;
+// macOS 悬停提示的额外文字偏移；字形已按可见边界居中，无需向下补偿。
+#[cfg(target_os = "macos")]
+pub const MAC_TOOLTIP_TEXT_OFFSET_Y: f32 = 0.0;
 
 // ============================================================================
 // 派生布局参数区：通常不需要修改
 // ============================================================================
 
 // 标题文字块高度由两行文字与行距自动相加。
-pub const HEADER_TITLE_BLOCK_HEIGHT: f32 =
-    HEADER_TITLE_MAIN_LINE_HEIGHT + HEADER_TITLE_LINES_GAP + HEADER_TITLE_SUBTITLE_LINE_HEIGHT;
+#[cfg(target_os = "macos")]
+pub const ACTIVE_HEADER_TITLE_LINES_GAP: f32 = MAC_HEADER_TITLE_LINES_GAP;
+#[cfg(not(target_os = "macos"))]
+pub const ACTIVE_HEADER_TITLE_LINES_GAP: f32 = HEADER_TITLE_LINES_GAP;
+#[cfg(target_os = "macos")]
+pub const ACTIVE_HEADER_SUBTITLE_ICON_OFFSET_Y: f32 = MAC_HEADER_SUBTITLE_ICON_OFFSET_Y;
+#[cfg(not(target_os = "macos"))]
+pub const ACTIVE_HEADER_SUBTITLE_ICON_OFFSET_Y: f32 = HEADER_SUBTITLE_ICON_OFFSET_Y;
+#[cfg(target_os = "macos")]
+pub const ACTIVE_HEADER_LOGO_OFFSET_Y: f32 = MAC_HEADER_LOGO_OFFSET_Y;
+#[cfg(not(target_os = "macos"))]
+pub const ACTIVE_HEADER_LOGO_OFFSET_Y: f32 = HEADER_LOGO_OFFSET_Y;
+#[cfg(target_os = "macos")]
+pub const ACTIVE_HEADER_TITLE_BLOCK_OFFSET_Y: f32 = MAC_HEADER_TITLE_BLOCK_OFFSET_Y;
+#[cfg(not(target_os = "macos"))]
+pub const ACTIVE_HEADER_TITLE_BLOCK_OFFSET_Y: f32 = HEADER_TITLE_BLOCK_OFFSET_Y;
+pub const HEADER_TITLE_BLOCK_HEIGHT: f32 = HEADER_TITLE_MAIN_LINE_HEIGHT
+    + ACTIVE_HEADER_TITLE_LINES_GAP
+    + HEADER_TITLE_SUBTITLE_LINE_HEIGHT;
 
 // 标题栏内容高度取 Logo、标题文字块和窗口控制圆点中的最大值，不再手工填写固定高度。
 pub const HEADER_CONTENT_HEIGHT: f32 = if HEADER_LOGO_HEIGHT > HEADER_TITLE_BLOCK_HEIGHT {
@@ -453,11 +505,7 @@ pub const MODEL_ACTION_BUTTON_HEIGHT: f32 = if MODEL_INSTALL_SIZE > MODEL_LAUNCH
     MODEL_LAUNCH_SIZE
 };
 
-pub const MODEL_ACTION_ROW_HEIGHT: f32 = if MODEL_CHIP_HEIGHT > MODEL_ACTION_BUTTON_HEIGHT {
-    MODEL_CHIP_HEIGHT
-} else {
-    MODEL_ACTION_BUTTON_HEIGHT
-};
+pub const MODEL_ACTION_ROW_HEIGHT: f32 = MODEL_ACTION_BUTTON_HEIGHT;
 
 // 区块 2 总高度 = 区块 2-1 + 两个子区块之间的距离 + 区块 2-2。
 pub const CLIENT_BLOCK_HEIGHT: f32 =

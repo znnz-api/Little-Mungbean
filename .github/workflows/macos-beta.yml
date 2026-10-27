@@ -1,0 +1,40 @@
+name: macOS Beta
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apple-silicon:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check macOS target
+        run: cargo check --locked --all-targets --target aarch64-apple-darwin
+      - name: Renderer injection tests
+        run: node --test tests/renderer-inject.test.js tests/model_menu_smoke.cjs
+      - name: macOS adapter tests
+        if: runner.arch == 'ARM64'
+        run: cargo test --locked --target aarch64-apple-darwin platform::macos_impl::tests
+      - name: Build Apple Silicon beta
+        run: bash scripts/build-macos.sh --beta
+      - name: Upload macOS beta
+        uses: actions/upload-artifact@v4
+        with:
+          name: Little-Mungbean-macos-arm64
+          path: |
+            release/macos/*.zip
+            release/macos/*.sha256
+          if-no-files-found: error

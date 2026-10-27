@@ -4,7 +4,12 @@ mod windows_impl;
 #[cfg(windows)]
 pub use windows_impl::*;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod macos_impl;
+#[cfg(target_os = "macos")]
+pub use macos_impl::*;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod portable {
     use anyhow::{Result, bail};
 
@@ -123,6 +128,10 @@ mod portable {
         bail!("当前平台尚未实现打开外部网址")
     }
 
+    pub fn open_directory(_path: &std::path::Path) -> Result<()> {
+        bail!("当前平台尚未实现打开配置目录")
+    }
+
     pub fn install_gui_panic_hook() {}
 
     pub fn report_gui_startup_failure(message: &str) {
@@ -183,5 +192,5 @@ mod portable {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub use portable::*;

@@ -1,15 +1,8 @@
 use anyhow::{Context, Result, bail};
 use url::Url;
 
-// Public builds use a neutral placeholder. The private build script can set
-// AGENT_SWITCH_DEFAULT_GATEWAY_URL and AGENT_SWITCH_KEY_PAGE_URL without
-// putting the private provider into the open-source default configuration.
-pub const KEY_PAGE_URL: Option<&str> = option_env!("AGENT_SWITCH_KEY_PAGE_URL");
-pub const CUSTOM_EDITION: bool = option_env!("AGENT_SWITCH_CUSTOM_EDITION").is_some();
-pub const DEFAULT_GATEWAY_URL: &str = match option_env!("AGENT_SWITCH_DEFAULT_GATEWAY_URL") {
-    Some(value) => value,
-    None => "",
-};
+// Public builds start with an empty endpoint so users choose their own gateway.
+pub const DEFAULT_GATEWAY_URL: &str = "";
 
 /// Append a canonical /v1 resource without duplicating provider API prefixes.
 /// Arbitrary reverse-proxy prefixes retain the existing /prefix/v1 behavior.
@@ -28,12 +21,6 @@ pub fn upstream_api_path(base: &Url, incoming: &str) -> String {
 pub const MAINLAND_ACCESS_ERROR: &str = "接口地址无法在中国大陆地区正常解析访问";
 pub const MAINLAND_ACCESS_ERROR_EN: &str =
     "The gateway address cannot be resolved or accessed normally from mainland China";
-const MAINLAND_ACCESS_HINT_ZH: &str =
-    "。接口地址 • 无法在中国大陆地区正常解析访问，请配置可供本机程序使用的代理或 VPN 后重试";
-const MAINLAND_ACCESS_HINT_EN: &str = "The gateway address cannot be resolved or accessed normally from mainland China. Configure a proxy or VPN available to local applications, then try again";
-const GENERIC_NETWORK_HINT_ZH: &str = "。请检查域名解析、系统或 HTTPS_PROXY 代理、VPN 以及防火墙";
-const GENERIC_NETWORK_HINT_EN: &str =
-    "Check DNS resolution, system or HTTPS_PROXY settings, VPN, and firewall";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayIdentity {
@@ -90,25 +77,6 @@ impl GatewayIdentity {
         // while never exposing the API key or query/fragment data.
         format!("From {}", self.base_url)
     }
-
-    fn is_remote_custom(&self) -> bool {
-        !self.is_znnz
-            && Url::parse(&self.base_url)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .is_some_and(|host| !is_loopback(&host))
-    }
-}
-
-pub fn connection_error_hint(gateway: &GatewayIdentity, error: &reqwest::Error) -> &'static str {
-    if !error.is_timeout() && !error.is_connect() {
-        return "";
-    }
-    if gateway.is_remote_custom() {
-        crate::i18n::tr(MAINLAND_ACCESS_HINT_ZH, MAINLAND_ACCESS_HINT_EN)
-    } else {
-        crate::i18n::tr(GENERIC_NETWORK_HINT_ZH, GENERIC_NETWORK_HINT_EN)
-    }
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -160,27 +128,6 @@ mod tests {
             "From https://gateway.example.com/api"
         );
         assert!(!custom.is_znnz);
-        assert!(custom.is_remote_custom());
-        assert!(!znnz.is_remote_custom());
-    }
-
-    #[test]
-    fn mainland_access_message_only_applies_to_remote_custom_gateways() {
-        assert!(
-            GatewayIdentity::parse("https://gateway.example.com")
-                .unwrap()
-                .is_remote_custom()
-        );
-        assert!(
-            !GatewayIdentity::parse("https://api.znnz.net")
-                .unwrap()
-                .is_remote_custom()
-        );
-        assert!(
-            !GatewayIdentity::parse("http://127.0.0.1:4000")
-                .unwrap()
-                .is_remote_custom()
-        );
     }
 
     #[test]

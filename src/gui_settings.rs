@@ -13,6 +13,8 @@ pub struct ClientConfiguration {
     pub api_key: String,
     #[serde(default)]
     pub preset_provider: Option<String>,
+    #[serde(default)]
+    pub conversion_enabled: bool,
 }
 
 impl Drop for ClientConfiguration {
@@ -224,10 +226,7 @@ fn load_key() -> Result<Option<Zeroizing<String>>> {
 }
 
 fn settings_root() -> Result<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .context("无法确定 LOCALAPPDATA")?;
-    Ok(local.join("Agent-Switch").join("gui"))
+    Ok(crate::platform_paths::data_root()?.join("gui"))
 }
 
 fn preferences_path() -> Result<PathBuf> {
@@ -299,12 +298,17 @@ pub(crate) fn protect_or_unprotect(input: &[u8], encrypt: bool) -> Result<Vec<u8
     Ok(bytes)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub(crate) fn protect_or_unprotect(input: &[u8], encrypt: bool) -> Result<Vec<u8>> {
+    crate::platform::protect_or_unprotect(input, encrypt)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn protect_or_unprotect(_input: &[u8], _encrypt: bool) -> Result<Vec<u8>> {
     bail!("当前平台尚未接入系统钥匙串，不能保存 API Key")
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -323,6 +327,7 @@ mod tests {
                     gateway_url: format!("https://{client}.test/v1"),
                     api_key: format!("secret-{client}"),
                     preset_provider: Some(format!("供应商-{client}")),
+                    conversion_enabled: false,
                 },
             );
         }

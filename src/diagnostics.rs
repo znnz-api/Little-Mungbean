@@ -6,7 +6,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item};
 
 pub async fn run(paths: &ClientPaths, gateway_url: &str, online: bool) -> Result<()> {
-    println!("znnz-client 只读诊断\n");
+    println!("little-mungbean-client 只读诊断\n");
     println!("用户目录:          {}", paths.user_home.display());
     println!("Codex home:        {}", paths.codex_home.display());
     println!("Claude home:       {}", paths.claude_home.display());
@@ -160,7 +160,11 @@ fn diagnose_claude(paths: &ClientPaths) {
 }
 
 fn diagnostic_key(paths: &ClientPaths) -> Result<Option<String>> {
-    for name in ["ZNNZ_API_KEY", "LITEAPI_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
+    for name in [
+        "LITTLE_MUNGBEAN_API_KEY",
+        "LITEAPI_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+    ] {
         if let Ok(value) = std::env::var(name)
             && !value.trim().is_empty()
         {

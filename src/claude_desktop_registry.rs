@@ -91,12 +91,12 @@ mod imp {
             .map(PathBuf::from)
             .context("无法确定 LOCALAPPDATA，不能安全保存 Claude Desktop 注册表备份")?;
         Ok(local
-            .join("Agent-Switch")
+            .join("Little-Mungbean")
             .join("claude-desktop")
             .join("registry-backup.dpapi"))
     }
 
-    pub fn is_agent_switch_gateway() -> Result<bool> {
+    pub fn is_little_mungbean_gateway() -> Result<bool> {
         if backup_path()?.is_file() {
             return Ok(true);
         }
@@ -131,14 +131,14 @@ mod imp {
         clear_stale_gateway_policy()
     }
 
-    /// Remove only a recognizable Agent-Switch loopback policy when its
+    /// Remove only a recognizable Little-Mungbean loopback policy when its
     /// encrypted snapshot is missing (for example after an older build or an
     /// interrupted account-mode transition). Never touch remote or unrelated
     /// enterprise policies.
     pub fn clear_stale_gateway_policy() -> Result<()> {
         // Compatibility with a missing backup: only remove a local gateway,
         // never an unrelated enterprise policy or a remote inference gateway.
-        if !is_agent_switch_gateway()? {
+        if !is_little_mungbean_gateway()? {
             return Ok(());
         }
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -175,6 +175,42 @@ mod imp {
             .map(PathBuf::from)
             .context("无法确定 LOCALAPPDATA")?;
         Ok(local.join("Claude-3p").join("claude_desktop_config.json"))
+    }
+
+    pub fn configuration_directory() -> Result<PathBuf> {
+        desktop_config_path()?
+            .parent()
+            .map(Path::to_path_buf)
+            .context("无法确定 Claude Desktop 配置目录")
+    }
+
+    pub fn connection_details() -> Result<Option<(String, String)>> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let key = match hkcu.open_subkey_with_flags(POLICY_PATH, KEY_READ) {
+            Ok(key) => key,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("无法读取 Claude Desktop 网关配置"),
+        };
+        let url: String = match key.get_value("inferenceGatewayBaseUrl") {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("无法读取 Claude Desktop 网关地址"),
+        };
+        let token: String = match key.get_value("inferenceGatewayApiKey") {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("无法读取 Claude Desktop 网关令牌"),
+        };
+        if !url::Url::parse(&url).ok().is_some_and(|parsed| {
+            matches!(
+                parsed.host_str(),
+                Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+            )
+        }) || token.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some((url, token)))
     }
 
     fn optional_file_contents(path: &Path) -> Result<Option<String>> {
@@ -710,7 +746,11 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[path = "claude_desktop_macos.rs"]
+mod imp;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
     use anyhow::{Result, bail};
     use std::path::PathBuf;
@@ -738,10 +778,16 @@ mod imp {
     pub fn backup_path() -> Result<PathBuf> {
         bail!("当前平台不支持 Claude Desktop Windows 注册表配置")
     }
+    pub fn configuration_directory() -> Result<PathBuf> {
+        bail!("当前平台不支持 Claude Desktop 配置目录")
+    }
+    pub fn connection_details() -> Result<Option<(String, String)>> {
+        bail!("当前平台不支持读取 Claude Desktop 网关配置")
+    }
     pub fn restore_pending() -> Result<bool> {
         bail!("当前平台不支持 Claude Desktop Windows 注册表配置")
     }
-    pub fn is_agent_switch_gateway() -> Result<bool> {
+    pub fn is_little_mungbean_gateway() -> Result<bool> {
         Ok(false)
     }
     pub fn restore_account_mode() -> Result<()> {

@@ -11,11 +11,20 @@ use eframe::egui::{
     Stroke, TextureHandle, TextureOptions, Vec2,
 };
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::io::Cursor;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
+
+mod about_ui;
+mod mcp_ui;
+mod skills_ui;
+#[cfg(test)]
+mod test_render;
+pub(crate) mod text_menu;
 
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -64,16 +73,32 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const LOG_SECTION_FOOTER: &str = "=========================================";
 // Keep one empty line between completed runtime-log sections.
 const LOG_SECTION_SEPARATOR: &str = "\n\n";
-pub const WINDOW_TITLE: &str = if crate::gateway::CUSTOM_EDITION {
-    "znnz • Agent-Switch • v1.1"
-} else {
-    "Agent • Switch • v1.1"
-};
-const LOGO_URL: &str = "https://r.networkpe.top/Agent-Switch-Logo";
-const UPDATE_URL: &str = "https://r.networkpe.top/Agent-Switch-Update";
-const GITHUB_URL: &str = "https://r.networkpe.top/Agent-Switch-GitHub";
-const STAR_URL: &str = "https://r.networkpe.top/Agent-Switch-star";
-const HELP_URL: &str = "https://r.networkpe.top/Agent-Switch-help";
+pub fn window_title() -> &'static str {
+    if i18n::language() == i18n::Language::ZhCn {
+        "小绿豆 • Little Mungbean • v1.1"
+    } else {
+        "Little Mungbean • v1.1"
+    }
+}
+const LOGO_URL: &str = "https://r.networkpe.top/Little-Mungbean-Logo-ZH";
+const UPDATE_URL: &str = "https://r.networkpe.top/Little-Mungbean-Update-ZH";
+const GITHUB_URL: &str = "https://r.networkpe.top/Little-Mungbean-GitHub-ZH";
+const STAR_URL: &str = "https://r.networkpe.top/Little-Mungbean-star-ZH";
+const HELP_URL: &str = "https://r.networkpe.top/Little-Mungbean-help-ZH";
+
+fn localized_header_url(zh_url: &'static str, language: i18n::Language) -> &'static str {
+    if language == i18n::Language::ZhCn {
+        return zh_url;
+    }
+    match zh_url {
+        LOGO_URL => "https://r.networkpe.top/Little-Mungbean-Logo-EN",
+        UPDATE_URL => "https://r.networkpe.top/Little-Mungbean-Update-EN",
+        GITHUB_URL => "https://r.networkpe.top/Little-Mungbean-GitHub-EN",
+        STAR_URL => "https://r.networkpe.top/Little-Mungbean-star-EN",
+        HELP_URL => "https://r.networkpe.top/Little-Mungbean-help-EN",
+        _ => zh_url,
+    }
+}
 const RUNTIME_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const INSTALLATION_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const INPUT_AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
@@ -89,8 +114,10 @@ const GUI_RENDERER: eframe::Renderer = eframe::Renderer::Glow;
 const GUI_RENDERER_NAME: &str = "Glow/OpenGL";
 #[cfg(feature = "renderer-wgpu")]
 const GUI_RENDERER: eframe::Renderer = eframe::Renderer::Wgpu;
-#[cfg(feature = "renderer-wgpu")]
+#[cfg(all(feature = "renderer-wgpu", not(target_os = "macos")))]
 const GUI_RENDERER_NAME: &str = "WGPU/DirectX";
+#[cfg(all(feature = "renderer-wgpu", target_os = "macos"))]
+const GUI_RENDERER_NAME: &str = "WGPU/Metal";
 
 pub fn run() -> Result<()> {
     let _background = crate::background::Host::start()?;
@@ -106,7 +133,7 @@ pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         renderer: GUI_RENDERER,
         viewport: egui::ViewportBuilder::default()
-            .with_title(WINDOW_TITLE)
+            .with_title(window_title())
             .with_icon(icon)
             .with_inner_size([layout::WINDOW_WIDTH, layout::WINDOW_HEIGHT])
             .with_min_inner_size([layout::WINDOW_WIDTH, layout::WINDOW_HEIGHT])
@@ -114,13 +141,23 @@ pub fn run() -> Result<()> {
             .with_resizable(false)
             // Windows 下从 CreateWindowExW 开始保持隐藏；eframe 会在首帧完成绘制后再显示。
             // 这样初始化期间即使系统处理非客户区消息，也没有半成品窗口暴露到桌面。
-            .with_visible(false)
-            .with_decorations(false)
+            .with_visible(cfg!(target_os = "macos"))
+            .with_decorations(cfg!(target_os = "macos"))
             .with_transparent(false)
-            .with_has_shadow(false),
+            .with_has_shadow(cfg!(target_os = "macos")),
         // 不保存也不恢复 eframe 的历史窗口位置；每次启动都由 Win32 重新贴靠右下角。
         persist_window: false,
         ..Default::default()
+    };
+    #[cfg(target_os = "macos")]
+    let options = eframe::NativeOptions {
+        viewport: options
+            .viewport
+            .with_title_shown(false)
+            .with_titlebar_shown(false)
+            .with_fullsize_content_view(true)
+            .with_titlebar_buttons_shown(false),
+        ..options
     };
     #[cfg(windows)]
     // winit 即使在 decorations=false 时也会把 WS_CAPTION / WS_BORDER 传给
@@ -130,7 +167,7 @@ pub fn run() -> Result<()> {
         NativeCreateHook::install().context("无法安装 Windows 原生窗口创建钩子")?;
 
     eframe::run_native(
-        WINDOW_TITLE,
+        window_title(),
         options,
         Box::new(|creation| Ok(Box::new(LauncherApp::new(creation)?))),
     )
@@ -152,7 +189,58 @@ enum LogView {
     Model,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientOperation {
+    Start,
+    Restart,
+    RestartModelList,
+    Account,
+}
+
+impl ClientOperation {
+    fn progress(self, language: i18n::Language) -> &'static str {
+        match self {
+            Self::Start => language.text("正在启动 & 连接...", "Starting & Connecting..."),
+            Self::Restart => language.text(
+                "正在重启 & 刷新提供商与模型列表...",
+                "Restarting & Refreshing provider & models...",
+            ),
+            Self::RestartModelList => language.text(
+                "正在重启 & 注入模型列表...",
+                "Restarting & Injecting models...",
+            ),
+            Self::Account => language.text("正在切换账号模式...", "Switching account mode..."),
+        }
+    }
+    fn log_title(self, label: &str, language: i18n::Language) -> String {
+        format!(
+            "{label} • {}",
+            match self {
+                Self::Start => language.text("启动 • 连接", "Start • Connect"),
+                Self::Restart | Self::RestartModelList => {
+                    language.text("重启 • 连接", "Restart • Connect")
+                }
+                Self::Account => language.text("切换账号模式", "Switch account mode"),
+            }
+        )
+    }
+    fn failure(self, label: &str, language: i18n::Language) -> String {
+        let detail = match self {
+            Self::Start => language.text(
+                "启动 & 连接 • 失败 • 请查看运行日志...",
+                "Start & Connect • Failed • Check the runtime log...",
+            ),
+            Self::Restart | Self::RestartModelList | Self::Account => language.text(
+                "自动重启 • 失败 • 请查看运行日志...",
+                "Auto-restart • Failed • Check the runtime log...",
+            ),
+        };
+        format!("{label} • {detail}")
+    }
+}
+
 struct RunningTask {
+    operation: Option<ClientOperation>,
     configuration_fingerprint: Option<String>,
     sequence: u64,
     kind: TaskKind,
@@ -171,23 +259,73 @@ struct CompletedLogSection {
     text: String,
 }
 
+#[derive(Clone, Copy)]
+enum ConnectionAction {
+    CopyToken,
+    OpenDirectory,
+}
+
+struct ConnectionActionResult {
+    action: ConnectionAction,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelListSelectionStatus {
+    target: ClientTarget,
+    active: Option<ModelListMode>,
+    selected: ModelListMode,
+}
+
+impl ModelListSelectionStatus {
+    fn restart_pending(self) -> bool {
+        self.active.is_some_and(|active| active != self.selected)
+    }
+
+    fn shows_check(self) -> bool {
+        self.active == Some(self.selected)
+    }
+
+    fn text(self, language: i18n::Language) -> String {
+        let text = format!(
+            "{} • {}",
+            self.target.title(),
+            model_mode_label_for_language(self.selected, language)
+        );
+        if self.restart_pending() {
+            format!("{text} • {}", language.text("重启生效", "Restart to apply"))
+        } else {
+            text
+        }
+    }
+}
+
 struct GuiAssets {
+    background: TextureHandle,
     client_card_normal: TextureHandle,
     client_card_hover_selected: TextureHandle,
     client_card_running: TextureHandle,
     client_card_running_connected: TextureHandle,
     logo: TextureHandle,
     update: TextureHandle,
+    refresh: TextureHandle,
+    search: TextureHandle,
     github: TextureHandle,
     star: TextureHandle,
     help: TextureHandle,
     url: TextureHandle,
+    link: TextureHandle,
     server: TextureHandle,
     key: TextureHandle,
     statistics: TextureHandle,
     convert: TextureHandle,
     converting: Vec<TextureHandle>,
     models: TextureHandle,
+    mcp: TextureHandle,
+    skills: TextureHandle,
+    about: TextureHandle,
+    default_models: TextureHandle,
+    gateway_models: TextureHandle,
     install: TextureHandle,
     login_mode: TextureHandle,
     spinner: Vec<TextureHandle>,
@@ -207,7 +345,6 @@ struct GuiAssets {
     history_delete: TextureHandle,
     history_edit: TextureHandle,
     history_confirm: TextureHandle,
-    select: TextureHandle,
     select_green: TextureHandle,
     copy: TextureHandle,
     log: TextureHandle,
@@ -223,6 +360,41 @@ impl GuiAssets {
         let client_icon_size =
             Vec2::splat(layout::CLIENT_CARD_WIDTH.min(layout::CLIENT_CARD_HEIGHT) * 0.60);
         Self {
+            background: load_embedded_png_texture(
+                context,
+                "gui-content-background-png",
+                include_bytes!("../assets/gui/bg.png"),
+            ),
+            about: load_embedded_svg_texture(
+                context,
+                "gui-about",
+                include_bytes!("../assets/gui/svg/about.svg"),
+                Vec2::splat(16.0),
+            ),
+            skills: load_embedded_svg_texture(
+                context,
+                "gui-skills",
+                include_bytes!("../assets/gui/svg/skill.svg"),
+                Vec2::splat(16.0),
+            ),
+            mcp: load_embedded_svg_texture(
+                context,
+                "gui-mcp",
+                include_bytes!("../assets/gui/svg/MCP.svg"),
+                Vec2::splat(16.0),
+            ),
+            default_models: load_embedded_svg_texture(
+                context,
+                "gui-default-models",
+                include_bytes!("../assets/gui/svg/default-models.svg"),
+                Vec2::splat(16.0),
+            ),
+            gateway_models: load_embedded_svg_texture(
+                context,
+                "gui-gateway-models",
+                include_bytes!("../assets/gui/svg/gateway-models.svg"),
+                Vec2::splat(16.0),
+            ),
             providers: Vec::new(),
             client_card_normal: load_embedded_svg_texture(
                 context,
@@ -260,6 +432,18 @@ impl GuiAssets {
                 include_bytes!("../assets/gui/svg/Update.svg"),
                 Vec2::splat(layout::HEADER_SUBTITLE_ICON_SIZE),
             ),
+            refresh: load_embedded_svg_texture(
+                context,
+                "gui-refresh",
+                include_bytes!("../assets/gui/svg/refresh.svg"),
+                Vec2::splat(13.0),
+            ),
+            search: load_embedded_svg_texture(
+                context,
+                "gui-search",
+                include_bytes!("../assets/gui/svg/search.svg"),
+                Vec2::splat(13.0),
+            ),
             github: load_embedded_svg_texture(
                 context,
                 "gui-github-svg",
@@ -283,6 +467,12 @@ impl GuiAssets {
                 "gui-url-svg",
                 include_bytes!("../assets/gui/svg/url.svg"),
                 Vec2::splat(16.0),
+            ),
+            link: load_embedded_svg_texture(
+                context,
+                "gui-link-svg",
+                include_bytes!("../assets/gui/svg/link.svg"),
+                Vec2::splat(13.0),
             ),
             server: load_embedded_svg_texture(
                 context,
@@ -458,12 +648,6 @@ impl GuiAssets {
                 include_bytes!("../assets/gui/svg/history-delete.svg"),
                 Vec2::splat(16.0),
             ),
-            select: load_embedded_svg_texture(
-                context,
-                "gui-select-svg",
-                include_bytes!("../assets/gui/svg/select.svg"),
-                Vec2::new(layout::MODEL_CHECK_WIDTH, layout::MODEL_CHECK_HEIGHT),
-            ),
             log: load_embedded_svg_texture(
                 context,
                 "gui-log-svg",
@@ -580,6 +764,7 @@ struct LauncherApp {
     conversion_enabled: bool,
     preset_provider: Option<String>,
     history_delete_guard: Option<(String, Instant)>,
+    history_delete_confirm: Option<(String, Instant)>,
     providers: Vec<crate::gui_providers::Provider>,
     provider_job: Option<crate::background::ProviderJob>,
     api_key: Zeroizing<String>,
@@ -611,23 +796,34 @@ struct LauncherApp {
     attached_clients: Vec<ClientTarget>,
     attached_urls: Vec<(ClientTarget, String)>,
     attached_configurations: Vec<(ClientTarget, String)>,
+    active_model_list_modes: std::collections::HashMap<ClientTarget, ModelListMode>,
+    model_list_selection_status: Option<ModelListSelectionStatus>,
     installed_clients: ClientInstallations,
     gateway_managed_clients: Vec<ClientTarget>,
     status: String,
     /// Raw result status and the configuration captured when its worker started.
     gateway_result_configuration: Option<(String, String)>,
     status_is_warning: bool,
+    connection_action_feedback: Option<(String, Instant, bool)>,
     log_text: String,
+    log_text_dirty: bool,
     completed_logs: Vec<CompletedLogSection>,
     next_log_sequence: u64,
     session_log_path: Option<PathBuf>,
     assets: GuiAssets,
     show_logs: bool,
+    mcp: mcp_ui::State,
+    skills: skills_ui::State,
+    about: about_ui::State,
     log_view: LogView,
     #[cfg(windows)]
     native_window: Option<NativeWindowState>,
     #[cfg(windows)]
     tray: crate::tray::Tray,
+    #[cfg(target_os = "macos")]
+    macos_tray: crate::macos_tray::Tray,
+    #[cfg(target_os = "macos")]
+    macos_window: crate::macos_window::Window,
     allow_exit: bool,
     last_runtime_scan: SystemTime,
     last_installation_scan: SystemTime,
@@ -644,6 +840,7 @@ struct LauncherApp {
 
 impl LauncherApp {
     fn new(creation: &eframe::CreationContext<'_>) -> Result<Self> {
+        text_menu::initialize(creation)?;
         #[cfg(windows)]
         let native_window = NativeWindowState::configure(creation);
         #[cfg(windows)]
@@ -651,6 +848,10 @@ impl LauncherApp {
             native_window.as_ref().context("无法取得托盘所属窗口")?.hwnd,
             creation.egui_ctx.clone(),
         )?;
+        #[cfg(target_os = "macos")]
+        let macos_tray = crate::macos_tray::Tray::new(creation.egui_ctx.clone())?;
+        #[cfg(target_os = "macos")]
+        let macos_window = crate::macos_window::Window::new(creation)?;
         install_fonts(&creation.egui_ctx);
         configure_style(&creation.egui_ctx);
         let assets = GuiAssets::load(&creation.egui_ctx);
@@ -708,17 +909,26 @@ impl LauncherApp {
             ),
         };
         let had_settings_warning = warning.is_some();
-        let conversion_enabled = gui_settings::conversion_for_configuration(
-            &preferences.gateway_url,
-            key.as_ref().map(|value| value.as_str()).unwrap_or(""),
-        )
-        .unwrap_or(false);
+        let current_key = key.as_ref().map(|value| value.as_str()).unwrap_or("");
+        let conversion_enabled = client_configurations
+            .get(selected.id())
+            .filter(|configuration| {
+                normalized_gateway_url(&configuration.gateway_url)
+                    == normalized_gateway_url(&preferences.gateway_url)
+                    && configuration.api_key.trim() == current_key.trim()
+            })
+            .map(|configuration| configuration.conversion_enabled)
+            .unwrap_or_else(|| {
+                gui_settings::conversion_for_configuration(&preferences.gateway_url, current_key)
+                    .unwrap_or(false)
+            });
         let mut app = Self {
             gateway_url: preferences.gateway_url.clone(),
             gateway_url_display: preferences.gateway_url,
             conversion_enabled,
             preset_provider: preferences.preset_provider,
             history_delete_guard: None,
+            history_delete_confirm: None,
             providers: Vec::new(),
             provider_job: None,
             api_key: key.unwrap_or_else(|| Zeroizing::new(String::new())),
@@ -750,22 +960,33 @@ impl LauncherApp {
             attached_clients: Vec::new(),
             attached_urls: Vec::new(),
             attached_configurations: Vec::new(),
+            active_model_list_modes: std::collections::HashMap::new(),
+            model_list_selection_status: None,
             installed_clients,
             gateway_managed_clients: Vec::new(),
             status: warning.unwrap_or_else(|| default_status().to_owned()),
             gateway_result_configuration: None,
             status_is_warning: had_settings_warning,
+            connection_action_feedback: None,
             log_text: String::new(),
+            log_text_dirty: true,
             completed_logs: Vec::new(),
             next_log_sequence: 1,
             session_log_path,
             assets,
             show_logs: false,
+            mcp: mcp_ui::State::default(),
+            skills: skills_ui::State::default(),
+            about: about_ui::State::default(),
             log_view: LogView::Runtime,
             #[cfg(windows)]
             native_window,
             #[cfg(windows)]
             tray,
+            #[cfg(target_os = "macos")]
+            macos_tray,
+            #[cfg(target_os = "macos")]
+            macos_window,
             allow_exit: false,
             last_runtime_scan: UNIX_EPOCH,
             last_installation_scan: SystemTime::now(),
@@ -833,8 +1054,8 @@ impl LauncherApp {
         self.preset_provider = None;
         self.gateway_url.clone_from(&entry.gateway_url);
         *self.api_key = entry.api_key.clone();
-        self.conversion_enabled = entry.conversion_enabled;
         self.refresh_gateway_display();
+        self.restore_conversion_setting();
         self.show_key = false;
         if changed {
             self.show_models = false;
@@ -869,8 +1090,8 @@ impl LauncherApp {
             self.gateway_url.clone_from(&configuration.gateway_url);
             *self.api_key = configuration.api_key.clone();
             self.preset_provider = configuration.preset_provider.clone();
+            self.conversion_enabled = configuration.conversion_enabled;
             self.refresh_gateway_display();
-            self.restore_conversion_setting();
             self.show_key = false;
             if changed {
                 self.show_models = false;
@@ -888,21 +1109,33 @@ impl LauncherApp {
                     gateway_url: self.gateway_url.clone(),
                     api_key: self.api_key.to_string(),
                     preset_provider: self.preset_provider.clone(),
+                    conversion_enabled: self.conversion_enabled,
                 },
             );
         }
     }
 
     fn restore_conversion_setting(&mut self) {
-        self.conversion_enabled = self.history.iter().any(|entry| {
+        let remembered = self
+            .client_configurations
+            .get(self.selected.id())
+            .filter(|configuration| {
+                normalized_gateway_url(&configuration.gateway_url)
+                    == normalized_gateway_url(&self.gateway_url)
+                    && configuration.api_key.trim() == self.api_key.trim()
+            })
+            .map(|configuration| configuration.conversion_enabled);
+        let legacy = self.history.iter().any(|entry| {
             normalized_gateway_url(&entry.gateway_url) == normalized_gateway_url(&self.gateway_url)
                 && entry.api_key.trim() == self.api_key.trim()
                 && entry.conversion_enabled
-        }) && conversion_inputs_present(
-            &self.gateway_url_display,
-            &self.gateway_url,
-            &self.api_key,
-        );
+        });
+        self.conversion_enabled = remembered.unwrap_or(legacy)
+            && conversion_inputs_present(
+                &self.gateway_url_display,
+                &self.gateway_url,
+                &self.api_key,
+            );
     }
 
     fn model_list_mode(&self, target: ClientTarget) -> ModelListMode {
@@ -923,10 +1156,46 @@ impl LauncherApp {
         }
     }
 
+    fn active_model_list_mode(&self, target: ClientTarget) -> Option<ModelListMode> {
+        self.client_is_attached(target)
+            .then(|| {
+                crate::background::client_model_list_mode(target)
+                    .or_else(|| self.active_model_list_modes.get(&target).copied())
+            })
+            .flatten()
+    }
+
+    fn visible_model_list_status(&self) -> Option<ModelListSelectionStatus> {
+        self.model_list_selection_status.filter(|status| {
+            self.client_selected
+                && status.target == self.selected
+                && !self.status_is_warning
+                && self.status == status.text(i18n::language())
+        })
+    }
+
+    fn select_model_list_mode(&mut self, target: ClientTarget, mode: ModelListMode) {
+        self.set_model_list_mode(target, mode);
+        let status = ModelListSelectionStatus {
+            target,
+            active: self.active_model_list_mode(target),
+            selected: mode,
+        };
+        self.status = status.text(i18n::language());
+        self.model_list_selection_status = Some(status);
+        self.status_is_warning = false;
+        self.mark_preferences_dirty();
+    }
+
     fn allocate_log_sequence(&mut self) -> u64 {
         let sequence = self.next_log_sequence;
         self.next_log_sequence = self.next_log_sequence.saturating_add(1);
         sequence
+    }
+
+    fn push_running_task(&mut self, task: RunningTask) {
+        self.log_text_dirty = true;
+        self.running.push(task);
     }
 
     fn attach_runtime_state(&mut self, state: ClientRuntimeState) {
@@ -934,10 +1203,13 @@ impl LauncherApp {
         if self.is_running(kind) {
             return;
         }
-        self.set_model_list_mode(state.client, state.model_list_mode);
+        // The persisted choice is the next requested mode. Do not overwrite it
+        // when the monitor is refreshed; the runtime state is the mode that is
+        // currently active in the client.
         let sequence = self.allocate_log_sequence();
         self.latest_client_jobs.insert(state.client, sequence);
-        self.running.push(RunningTask {
+        self.push_running_task(RunningTask {
+            operation: None,
             configuration_fingerprint: local_gateway::attached_configuration_fingerprint(
                 state.client,
             ),
@@ -955,6 +1227,7 @@ impl LauncherApp {
     }
 
     fn sync_runtime_states(&mut self) -> Result<()> {
+        let model_status = self.visible_model_list_status();
         self.gateway_managed_clients = ClientTarget::ALL
             .into_iter()
             .filter(|target| {
@@ -1013,6 +1286,10 @@ impl LauncherApp {
         }
         let mut states = runtime_state::load_active_states()?;
         states.sort_by_key(|state| state.started_at_ms);
+        self.active_model_list_modes = states
+            .iter()
+            .map(|state| (state.client, state.model_list_mode))
+            .collect();
         self.last_runtime_scan = SystemTime::now();
 
         let mut completed_logs = Vec::new();
@@ -1027,7 +1304,7 @@ impl LauncherApp {
                 task.kind == TaskKind::Client(state.client) && task.worker_pid == state.worker_pid
             });
             if !active {
-                refresh_task_log(task);
+                refresh_task_log(task, true);
                 completed_logs.push((
                     task.sequence,
                     format_log_section(&task.log_title, &task.log_text),
@@ -1041,6 +1318,11 @@ impl LauncherApp {
 
         for state in states {
             self.attach_runtime_state(state);
+        }
+        if let Some(mut status) = model_status {
+            status.active = self.active_model_list_mode(status.target);
+            self.status = status.text(i18n::language());
+            self.model_list_selection_status = Some(status);
         }
         Ok(())
     }
@@ -1077,6 +1359,7 @@ impl LauncherApp {
         // 未选择客户端时只刷新安装缓存，不用上次保存的客户端覆盖默认提示。
         if !self.client_selected
             || self.status_is_warning
+            || self.visible_model_list_status().is_some()
             || is_model_list_change_status(&self.status)
             || is_model_name_copied_status(&self.status)
         {
@@ -1152,6 +1435,7 @@ impl LauncherApp {
     }
 
     fn toggle_protocol_conversion(&mut self) {
+        self.model_list_selection_status = None;
         if let Err(error) = self.validate_inputs() {
             self.set_error(error);
             return;
@@ -1170,8 +1454,10 @@ impl LauncherApp {
         }
         let previous = self.conversion_enabled;
         self.conversion_enabled = !self.conversion_enabled;
+        self.remember_client_inputs();
         if let Err(error) = self.remember_configuration() {
             self.conversion_enabled = previous;
+            self.remember_client_inputs();
             self.set_error(error);
             return;
         }
@@ -1184,7 +1470,7 @@ impl LauncherApp {
                 i18n::tr("已关闭", "Disabled")
             }
         );
-        if self.configuration_is_current(self.selected) {
+        if self.gateway_configuration_is_current(self.selected) {
             let arguments = gateway_update_arguments(self.selected, &self.gateway_url);
             match self.spawn_worker(
                 TaskKind::GatewayUpdate(self.selected),
@@ -1192,12 +1478,25 @@ impl LauncherApp {
                 &arguments,
                 true,
             ) {
-                Ok(task) => self.running.push(task),
+                Ok(task) => self.push_running_task(task),
                 Err(error) => {
                     self.set_error(error);
                     return;
                 }
             }
+        } else {
+            let title = task_log_title(
+                TaskKind::GatewayUpdate(self.selected),
+                self.selected.title(),
+            );
+            let body = crate::gui_worker::protocol_conversion_message(
+                self.gateway_url_display.trim(),
+                self.conversion_enabled,
+                false,
+            );
+            let sequence = self.allocate_log_sequence();
+            self.append_completed_log(sequence, format_log_section(&title, &body));
+            self.rebuild_log_text();
         }
         self.status = conversion_status;
         self.status_is_warning = false;
@@ -1275,10 +1574,12 @@ impl LauncherApp {
                                         ui,
                                         i18n::tr("提供商记录", "Provider Records"),
                                         layout::PROVIDER_RECORDS_TITLE_LINE_LENGTH,
+                                        layout::PROVIDER_RECORDS_TITLE_TOP_GAP,
                                         layout::PROVIDER_RECORDS_TITLE_BOTTOM_GAP,
                                     );
                                 }
                                 for (index, entry) in self.history.iter().enumerate() {
+                                    let mut delete_tooltip = None;
                                     let (rect, _) = ui.allocate_exact_size(
                                         egui::vec2(
                                             ui.available_width(),
@@ -1390,13 +1691,24 @@ impl LauncherApp {
                                     if editing {
                                         let response = ui.place(
                                             text_rect.shrink2(egui::vec2(0.0, 2.0)),
-                                            egui::TextEdit::singleline(&mut self.history_name)
+                                            |ui: &mut egui::Ui| {
+                                                let output = egui::TextEdit::singleline(
+                                                    &mut self.history_name,
+                                                )
                                                 .id(egui::Id::new(("history-name", &entry_id)))
                                                 .font(FontId::proportional(14.0))
                                                 .text_color(TEXT_MAIN)
                                                 .vertical_align(egui::Align::Center)
                                                 .margin(egui::Margin::ZERO)
-                                                .frame(egui::Frame::NONE),
+                                                .frame(egui::Frame::NONE)
+                                                .show(ui);
+                                                text_menu::attach(
+                                                    ui,
+                                                    output,
+                                                    &mut self.history_name,
+                                                    text_menu::Options::default(),
+                                                )
+                                            },
                                         );
                                         if self.history_name_focus {
                                             response.request_focus();
@@ -1567,6 +1879,16 @@ impl LauncherApp {
                                     if let Some(remaining) = delete_delay {
                                         ctx.request_repaint_after(remaining);
                                     }
+                                    let confirm_delete = self
+                                        .history_delete_confirm
+                                        .as_ref()
+                                        .filter(|(id, _)| id == &entry_id)
+                                        .and_then(|(_, started)| {
+                                            Duration::from_secs(4).checked_sub(started.elapsed())
+                                        });
+                                    if let Some(remaining) = confirm_delete {
+                                        ctx.request_repaint_after(remaining);
+                                    }
                                     if hovered && !editing && !in_use && delete_delay.is_none() {
                                         let response = ui.interact(
                                             delete_rect,
@@ -1594,9 +1916,37 @@ impl LauncherApp {
                                                 Color32::from_rgb(91, 97, 112)
                                             },
                                         );
-                                        show_hover_tooltip(&response, i18n::tr("删除", "Delete"));
+                                        let confirm = confirm_delete.is_some();
+                                        delete_tooltip = Some((
+                                            response.clone(),
+                                            if confirm {
+                                                i18n::tr(
+                                                    "再次点击确认删除",
+                                                    "Click again to confirm deletion",
+                                                )
+                                            } else {
+                                                i18n::tr("删除", "Delete")
+                                            },
+                                        ));
                                         if response.clicked() {
-                                            removed = Some(index);
+                                            if confirm {
+                                                removed = Some(index);
+                                                self.history_delete_confirm = None;
+                                            } else {
+                                                self.history_delete_confirm =
+                                                    Some((entry_id.clone(), Instant::now()));
+                                                self.status = delete_confirmation_status(
+                                                    if entry.name.is_empty() {
+                                                        &entry.gateway_url
+                                                    } else {
+                                                        &entry.name
+                                                    },
+                                                );
+                                                self.status_is_warning = false;
+                                                self.model_list_selection_status = None;
+                                                self.connection_action_feedback = None;
+                                                ctx.request_repaint();
+                                            }
                                         }
                                     }
                                     // Register controls above the row so they consume their own
@@ -1623,27 +1973,35 @@ impl LauncherApp {
                                             i18n::tr("未连接", "Not connected")
                                         },
                                     );
+                                    if let Some((response, hint)) = delete_tooltip {
+                                        show_hover_tooltip(&response, hint);
+                                    }
                                 }
-                                if !self.providers.is_empty() {
-                                    ui.add_space(layout::PROVIDER_TOP_GAP);
+                                let preset_providers: Vec<_> = self
+                                    .providers
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, provider)| provider.show_in.provider_presets())
+                                    .collect();
+                                if !preset_providers.is_empty() {
                                     paint_provider_section_title(
                                         ui,
                                         i18n::tr("提供商预设", "Provider Preset"),
                                         layout::PROVIDER_PRESET_TITLE_LINE_LENGTH,
+                                        layout::PROVIDER_PRESET_TITLE_TOP_GAP,
                                         layout::PROVIDER_PRESET_TITLE_BOTTOM_GAP,
                                     );
                                 }
-                                let providers = &self.providers;
+                                let providers = &preset_providers;
                                 let width = ui.available_width();
                                 let columns = provider_column_count(width, providers.len());
                                 ui.spacing_mut().item_spacing.y = layout::PROVIDER_ROW_GAP;
-                                for (row, entries) in providers.chunks(columns).enumerate() {
+                                for entries in providers.chunks(columns) {
                                     let (row_rect, _) = ui.allocate_exact_size(
                                         Vec2::new(width, layout::PROVIDER_BUTTON_SIZE),
                                         Sense::hover(),
                                     );
-                                    for (column, provider) in entries.iter().enumerate() {
-                                        let index = row * columns + column;
+                                    for (column, (index, provider)) in entries.iter().enumerate() {
                                         let rect = Rect::from_min_size(
                                             row_rect.min
                                                 + Vec2::new(
@@ -1662,17 +2020,23 @@ impl LauncherApp {
                                             )
                                             .on_hover_cursor(egui::CursorIcon::PointingHand);
                                         let [r, g, b] = layout::PROVIDER_BACKGROUND;
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            layout::PROVIDER_CORNER_RADIUS,
+                                        let background = if response.hovered() {
+                                            let [r, g, b, a] = layout::PROVIDER_HOVER_BACKGROUND;
+                                            Color32::from_rgba_unmultiplied(r, g, b, a)
+                                        } else {
                                             Color32::from_rgba_unmultiplied(
                                                 r,
                                                 g,
                                                 b,
                                                 layout::PROVIDER_BACKGROUND_ALPHA,
-                                            ),
+                                            )
+                                        };
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            layout::PROVIDER_CORNER_RADIUS,
+                                            background,
                                         );
-                                        if let Some(texture) = self.assets.providers.get(index) {
+                                        if let Some(texture) = self.assets.providers.get(*index) {
                                             paint_svg_texture(
                                                 ui,
                                                 texture,
@@ -1708,7 +2072,7 @@ impl LauncherApp {
                                         );
                                         show_hover_tooltip(&response, provider.name.clone());
                                         if response.clicked() {
-                                            selected_provider = Some(index);
+                                            selected_provider = Some(*index);
                                         }
                                     }
                                 }
@@ -1762,12 +2126,25 @@ impl LauncherApp {
             }
         } else if let Some(index) = removed {
             let mut history = self.history.clone();
-            history.remove(index);
+            let deleted = history.remove(index);
             self.editing_history = None;
             match gui_settings::save_history(&history) {
                 Ok(()) => {
                     self.history = history;
                     self.refresh_gateway_display();
+                    self.status = format!(
+                        "{} • {}",
+                        if deleted.name.is_empty() {
+                            &deleted.gateway_url
+                        } else {
+                            &deleted.name
+                        },
+                        i18n::tr("已删除", "Deleted")
+                    );
+                    self.status_is_warning = false;
+                    self.model_list_selection_status = None;
+                    self.connection_action_feedback = None;
+                    ctx.request_repaint();
                 }
                 Err(error) => self.set_error(error),
             }
@@ -2026,13 +2403,13 @@ impl LauncherApp {
                                         );
                                     let action = if hidden_models.contains(model) {
                                         i18n::tr(
-                                            "点击 • 开启此模型映射",
-                                            "Click • Enable This Model Mapping",
+                                            "点击 • 开启此模型注入",
+                                            "Click • Enable This Model Injection",
                                         )
                                     } else {
                                         i18n::tr(
-                                            "点击 • 关闭此模型映射",
-                                            "Click • Disable this model mapping",
+                                            "点击 • 关闭此模型注入",
+                                            "Click • Disable this model Injection",
                                         )
                                     };
                                     if !copy_response.hovered() {
@@ -2105,6 +2482,7 @@ impl LauncherApp {
     }
 
     fn start_gateway_test(&mut self, fetch_models: bool) {
+        self.model_list_selection_status = None;
         if self.gateway_action_running(fetch_models) {
             self.set_error(anyhow::anyhow!(i18n::tr(
                 "网关检查已经在运行",
@@ -2143,7 +2521,7 @@ impl LauncherApp {
         };
         match self.spawn_worker(TaskKind::GatewayTest, label, &arguments, true) {
             Ok(task) => {
-                self.running.push(task);
+                self.push_running_task(task);
                 self.status = status.to_owned();
                 self.status_is_warning = false;
             }
@@ -2152,22 +2530,30 @@ impl LauncherApp {
     }
 
     fn start_selected_client(&mut self) {
+        #[cfg(target_os = "macos")]
+        crate::network_proxy::refresh_macos_pac();
         if !self.client_selected {
             self.status = default_status().to_owned();
             self.status_is_warning = false;
             return;
         }
+        if let Err(error) = self.validate_inputs() {
+            self.set_error(error);
+            return;
+        }
         let target = self.selected;
+        let operation = self.client_operation(target);
         if self.configuration_is_current(target) {
             return;
         }
+        self.model_list_selection_status = None;
         if !self.client_is_installed(target) {
             self.status = client_launch_requires_install_status(target);
             self.status_is_warning = true;
             return;
         }
         if let Err(error) = self.remember_configuration() {
-            self.set_error(error);
+            self.set_client_operation_error(target, operation, error);
             return;
         }
         let kind = TaskKind::Client(target);
@@ -2175,11 +2561,7 @@ impl LauncherApp {
             || self.is_running(TaskKind::GatewayUpdate(target))
             || self.is_running(TaskKind::AccountMode(target))
         {
-            self.status = format!(
-                "{} • {}",
-                target.title(),
-                i18n::tr("自动重启 • 失败!", "Auto-restart • failed!")
-            );
+            self.status = operation.failure(target.title(), i18n::language());
             self.status_is_warning = true;
             return;
         }
@@ -2188,26 +2570,24 @@ impl LauncherApp {
         match self.spawn_worker(kind, target.title(), &arguments, true) {
             Ok(task) => {
                 self.latest_client_jobs.insert(target, task.sequence);
-                self.running.push(task);
+                self.push_running_task(task);
                 self.status = format!(
                     "{} • {}",
                     target.title(),
-                    if self.client_is_running(target) {
-                        i18n::tr(
-                            "正在重启 & 刷新提供商 & 模型列表",
-                            "Restarting & Refreshing provider & models",
-                        )
-                    } else {
-                        i18n::tr("正在启动 • 连接", "Starting • Connecting")
-                    }
+                    self.running
+                        .last()
+                        .and_then(|task| task.operation)
+                        .unwrap_or(ClientOperation::Start)
+                        .progress(i18n::language())
                 );
                 self.status_is_warning = false;
             }
-            Err(error) => self.set_error(error),
+            Err(error) => self.set_client_operation_error(target, operation, error),
         }
     }
 
     fn start_selected_client_install(&mut self) {
+        self.model_list_selection_status = None;
         if !self.client_selected {
             self.status = default_status().to_owned();
             self.status_is_warning = false;
@@ -2227,15 +2607,17 @@ impl LauncherApp {
                     // Suppress the old monitor's completion while the account job
                     // closes it, just as provider replacement already does.
                     self.latest_client_jobs.insert(target, task.sequence);
-                    self.running.push(task);
+                    self.push_running_task(task);
                     self.status = format!(
                         "{} • {}",
                         target.title(),
-                        i18n::tr("正在切换账号模式", "Switching account mode")
+                        ClientOperation::Account.progress(i18n::language())
                     );
                     self.status_is_warning = false;
                 }
-                Err(error) => self.set_error(error),
+                Err(error) => {
+                    self.set_client_operation_error(target, ClientOperation::Account, error)
+                }
             }
             return;
         }
@@ -2255,7 +2637,7 @@ impl LauncherApp {
         let label = format!("{} {}", i18n::tr("安装", "Install"), target.title());
         match self.spawn_worker(kind, &label, &arguments, false) {
             Ok(task) => {
-                self.running.push(task);
+                self.push_running_task(task);
                 self.status = format!(
                     "{} {} ...",
                     i18n::tr("正在安装", "Installing"),
@@ -2275,7 +2657,15 @@ impl LauncherApp {
         pass_api_key: bool,
     ) -> Result<RunningTask> {
         let executable = std::env::current_exe().context("无法确定当前启动器路径")?;
-        let log_title = task_log_title(kind, label);
+        // Capture the requested operation before reconnect closes the old client.
+        let operation = match kind {
+            TaskKind::Client(target) => Some(self.client_operation(target)),
+            TaskKind::AccountMode(_) => Some(ClientOperation::Account),
+            _ => None,
+        };
+        let log_title = operation
+            .map(|operation| operation.log_title(label, i18n::language()))
+            .unwrap_or_else(|| task_log_title(kind, label));
         let log_path = next_task_log_path(&task_log_slug(kind, label))?;
         let mut log = OpenOptions::new()
             .create(true)
@@ -2291,6 +2681,7 @@ impl LauncherApp {
         if let TaskKind::AccountMode(target) = kind {
             let job = crate::background::start_account_mode_job(target, log_path.clone())?;
             return Ok(RunningTask {
+                operation,
                 configuration_fingerprint: None,
                 sequence: self.allocate_log_sequence(),
                 kind,
@@ -2315,6 +2706,7 @@ impl LauncherApp {
                 log_path.clone(),
             )?;
             return Ok(RunningTask {
+                operation,
                 configuration_fingerprint: local_gateway::configuration_fingerprint(
                     &self.gateway_url,
                     &self.api_key,
@@ -2336,7 +2728,7 @@ impl LauncherApp {
         let mut command = Command::new(executable);
         command.args(arguments);
         for name in [
-            "ZNNZ_API_KEY",
+            "LITTLE_MUNGBEAN_API_KEY",
             "LITEAPI_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "OPENAI_API_KEY",
@@ -2345,10 +2737,10 @@ impl LauncherApp {
             command.env_remove(name);
         }
         if pass_api_key {
-            command.env("ZNNZ_API_KEY", self.api_key.as_str());
+            command.env("LITTLE_MUNGBEAN_API_KEY", self.api_key.as_str());
         }
         command
-            .env("ZNNZ_RUNTIME_LOG_PATH", &log_path)
+            .env("LITTLE_MUNGBEAN_RUNTIME_LOG_PATH", &log_path)
             .env(i18n::LANGUAGE_ENV, i18n::language().tag())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
@@ -2359,6 +2751,7 @@ impl LauncherApp {
         let worker_pid = child.id();
         let sequence = self.allocate_log_sequence();
         Ok(RunningTask {
+            operation,
             configuration_fingerprint: local_gateway::configuration_fingerprint(
                 &self.gateway_url,
                 &self.api_key,
@@ -2388,17 +2781,30 @@ impl LauncherApp {
             .filter(|task| task.kind == TaskKind::Client(target))
             .max_by_key(|task| task.sequence);
         latest.is_some_and(|task| {
-            task.job.is_some()
-                && (!self.client_is_attached(target)
-                    || !self
-                        .attached_configurations
-                        .iter()
-                        .any(|(client, fingerprint)| {
-                            *client == target
-                                && task.configuration_fingerprint.as_deref()
-                                    == Some(fingerprint.as_str())
-                        }))
+            // A restart must remain visibly busy even when the old runtime
+            // already has the same gateway fingerprint.  Otherwise the
+            // launch button loses its spinner and accepts a second click
+            // while the model catalog is still being injected.
+            task.job.as_ref().is_some_and(|job| !job.is_ready())
         })
+    }
+
+    fn client_operation(&self, target: ClientTarget) -> ClientOperation {
+        if !self.client_is_running(target) {
+            return ClientOperation::Start;
+        }
+        // A model-list-only change keeps the current gateway configuration;
+        // use the injection-specific progress text. Endpoint/key changes
+        // refresh both the provider route and the model list.
+        if self.gateway_configuration_is_current(target)
+            && self
+                .active_model_list_mode(target)
+                .is_some_and(|active| active != self.model_list_mode(target))
+        {
+            ClientOperation::RestartModelList
+        } else {
+            ClientOperation::Restart
+        }
     }
 
     fn gateway_action_running(&self, fetch_models: bool) -> bool {
@@ -2417,11 +2823,58 @@ impl LauncherApp {
         self.attached_clients.contains(&target)
     }
 
+    fn apply_connection_action(
+        &mut self,
+        target: ClientTarget,
+        result: Option<ConnectionActionResult>,
+    ) {
+        let Some(result) = result else {
+            return;
+        };
+        let (message, warning) = if let Some(error) = result.error {
+            (
+                format!(
+                    "{}：{error}",
+                    match result.action {
+                        ConnectionAction::CopyToken =>
+                            i18n::tr("复制连接令牌失败", "Failed to copy connection token"),
+                        ConnectionAction::OpenDirectory =>
+                            i18n::tr("打开配置目录失败", "Failed to open configuration directory"),
+                    }
+                ),
+                true,
+            )
+        } else {
+            (
+                match result.action {
+                    ConnectionAction::CopyToken => {
+                        i18n::tr("已复制连接令牌", "Connection token copied")
+                    }
+                    ConnectionAction::OpenDirectory => {
+                        i18n::tr("已打开配置目录", "Configuration directory opened")
+                    }
+                }
+                .to_owned(),
+                false,
+            )
+        };
+        self.connection_action_feedback = Some((
+            format!("{} • {message}", target.title()),
+            Instant::now() + Duration::from_secs(5),
+            warning,
+        ));
+    }
+
     fn client_is_installed(&self, target: ClientTarget) -> bool {
         self.client_is_running(target) || self.installed_clients.is_installed(target)
     }
 
     fn configuration_is_current(&self, target: ClientTarget) -> bool {
+        self.gateway_configuration_is_current(target)
+            && self.active_model_list_mode(target) == Some(self.model_list_mode(target))
+    }
+
+    fn gateway_configuration_is_current(&self, target: ClientTarget) -> bool {
         self.client_is_running(target)
             && self.client_is_attached(target)
             && configuration_matches(
@@ -2486,6 +2939,7 @@ impl LauncherApp {
         self.scan_installations_if_due();
         if self.client_selected
             && !self.status_is_warning
+            && self.visible_model_list_status().is_none()
             && !self.is_running(TaskKind::GatewayTest)
             && !self.is_running(TaskKind::GatewayUpdate(self.selected))
             && !self.client_connect_pending(self.selected)
@@ -2494,6 +2948,7 @@ impl LauncherApp {
             && !is_gateway_result_status(&self.status)
             && !is_model_list_change_status(&self.status)
             && !is_model_name_copied_status(&self.status)
+            && !is_delete_feedback_status(&self.status)
             && !is_protocol_conversion_status(&self.status)
             && !is_account_mode_status(&self.status)
         {
@@ -2508,7 +2963,7 @@ impl LauncherApp {
         let mut finished = Vec::new();
         let mut install_progress = None;
         for (index, task) in self.running.iter_mut().enumerate() {
-            refresh_task_log(task);
+            self.log_text_dirty |= refresh_task_log(task, false);
             if let Some(job) = &task.job {
                 if let Some(result) = job.poll() {
                     // Job errors are client/configuration errors already written to the
@@ -2540,7 +2995,7 @@ impl LauncherApp {
 
         for (index, success, wait_error) in finished.into_iter().rev() {
             let mut task = self.running.remove(index);
-            refresh_task_log(&mut task);
+            refresh_task_log(&mut task, true);
             if task.kind == TaskKind::GatewayTest && is_fetch_models_label(&task.label) {
                 let result_path = task.log_path.with_extension("models.json");
                 let result = fs::read(&result_path)
@@ -2564,10 +3019,14 @@ impl LauncherApp {
                 }
                 let _ = fs::remove_file(result_path);
             }
+            if let Some(error) = &wait_error {
+                task.log_text.push_str(&i18n::runtime_error_block(error));
+            }
             let completed_log = format_log_section(&task.log_title, &task.log_text);
             self.append_completed_log(task.sequence, completed_log);
 
             if let TaskKind::AccountMode(target) = task.kind {
+                self.model_list_selection_status = None;
                 self.last_runtime_scan = UNIX_EPOCH;
                 let _ = self.sync_runtime_states();
                 self.status = if success {
@@ -2618,14 +3077,7 @@ impl LauncherApp {
                         self.status_is_warning = true;
                     }
                 } else {
-                    self.status = format!(
-                        "{} • {}",
-                        target.title(),
-                        i18n::tr(
-                            "安装失败 • 请查看运行日志",
-                            "Installation failed • Check the runtime log"
-                        )
-                    );
+                    self.status = installation_failure_status(target, &task.log_text);
                     self.status_is_warning = true;
                 }
                 continue;
@@ -2641,12 +3093,9 @@ impl LauncherApp {
                 {
                     continue;
                 }
-                if let Some(error) = wait_error {
-                    self.status = format!(
-                        "{} {}: {error}",
-                        i18n::tr("无法读取后台状态", "Failed to read background status for"),
-                        task.label
-                    );
+                self.model_list_selection_status = None;
+                if wait_error.is_some() {
+                    self.status = failed_task_status(&task);
                     self.status_is_warning = true;
                 } else if success {
                     self.last_runtime_scan = UNIX_EPOCH;
@@ -2665,6 +3114,7 @@ impl LauncherApp {
             }
 
             if let TaskKind::GatewayUpdate(target) = task.kind {
+                self.model_list_selection_status = None;
                 if let Some(error) = wait_error {
                     self.status = format!(
                         "{} • {}: {error}",
@@ -2714,6 +3164,7 @@ impl LauncherApp {
     }
 
     fn append_completed_log(&mut self, sequence: u64, section: String) {
+        self.log_text_dirty = true;
         self.completed_logs.push(CompletedLogSection {
             sequence,
             text: section,
@@ -2727,17 +3178,41 @@ impl LauncherApp {
     }
 
     fn rebuild_log_text(&mut self) {
-        let completed = self
-            .completed_logs
-            .iter()
-            .map(|section| (section.sequence, section.text.clone()));
+        if !self.log_text_dirty {
+            return;
+        }
+        let completed = self.completed_logs.iter().map(|section| {
+            (
+                section.sequence,
+                std::borrow::Cow::Borrowed(section.text.as_str()),
+            )
+        });
         let running = self.running.iter().map(|task| {
             (
                 task.sequence,
-                format_log_section(&task.log_title, &task.log_text),
+                std::borrow::Cow::Owned(format_log_section(&task.log_title, &task.log_text)),
             )
         });
         self.log_text = join_ordered_log_sections(completed.chain(running));
+        self.log_text_dirty = false;
+    }
+
+    fn set_client_operation_error(
+        &mut self,
+        target: ClientTarget,
+        operation: ClientOperation,
+        error: anyhow::Error,
+    ) {
+        let detail = i18n::runtime_log_error(&error);
+        let title = operation.log_title(target.title(), i18n::language());
+        let sequence = self.allocate_log_sequence();
+        self.append_completed_log(
+            sequence,
+            format_log_section(&title, &i18n::runtime_error_block(&detail)),
+        );
+        self.rebuild_log_text();
+        self.status = operation.failure(target.title(), i18n::language());
+        self.status_is_warning = true;
     }
 
     fn set_error(&mut self, error: anyhow::Error) {
@@ -2767,6 +3242,39 @@ impl LauncherApp {
 }
 
 impl eframe::App for LauncherApp {
+    #[cfg(target_os = "macos")]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        self.macos_window.sync_input(input);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.macos_window.take_restore() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.request_repaint();
+        }
+        let (exit, show) = self.macos_tray.poll_requests();
+        if exit {
+            self.request_full_exit(ctx);
+        }
+        if show || crate::platform::take_show_request() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+        }
+        if ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Q)) {
+            self.request_full_exit(ctx);
+        }
+        if ctx.input(|input| input.viewport().close_requested()) && !self.allow_exit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if let Err(error) = self.save_preferences() {
+                self.set_error(error);
+            }
+        }
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // 主窗口改为不透明原生窗口，彻底避开 Windows 透明合成层留下的顶部黑线。
         Color32::from_rgba_unmultiplied(
@@ -2783,6 +3291,7 @@ impl eframe::App for LauncherApp {
         if self.tray.take_exit_request() {
             self.request_full_exit(ui.ctx());
         }
+        #[cfg(not(target_os = "macos"))]
         if ui.input(|input| input.viewport().close_requested()) && !self.allow_exit {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2801,6 +3310,30 @@ impl eframe::App for LauncherApp {
         }
 
         self.poll_tasks(ui.ctx());
+        if let Some((message, warning)) = self.skills.poll(ui.ctx()) {
+            if !message.is_empty() {
+                let sequence = self.next_log_sequence;
+                self.next_log_sequence += 1;
+                self.append_completed_log(sequence, format_log_section("Skills", &message));
+            }
+            if self.skills.open {
+                self.model_list_selection_status = None;
+                self.status = self.skills.status.clone();
+                self.status_is_warning = warning;
+            }
+        }
+        if let Some((message, warning)) = self.mcp.poll(ui.ctx()) {
+            if !message.is_empty() {
+                let sequence = self.next_log_sequence;
+                self.next_log_sequence += 1;
+                self.append_completed_log(sequence, format_log_section("MCP Server", &message));
+            }
+            if self.mcp.open {
+                self.model_list_selection_status = None;
+                self.status = self.mcp.status.clone();
+                self.status_is_warning = warning;
+            }
+        }
         ui.ctx().request_repaint_after(if self.running.is_empty() {
             RUNTIME_SCAN_INTERVAL
         } else {
@@ -2842,6 +3375,16 @@ impl eframe::App for LauncherApp {
 
         render_header(ui, &self.assets, header_rect);
         render_divider(ui, divider_top_rect);
+        let background_rect = Rect::from_min_max(
+            content_rect.min + Vec2::new(0.0, layout::CONTENT_BACKGROUND_MARGIN_TOP),
+            content_rect.max - Vec2::new(0.0, layout::CONTENT_BACKGROUND_MARGIN_BOTTOM),
+        );
+        paint_content_background(
+            ui,
+            background_rect,
+            background_rect,
+            &self.assets.background,
+        );
 
         let content_inner = Rect::from_min_max(
             content_rect.min + Vec2::new(layout::CONTENT_PADDING_LEFT, layout::CONTENT_PADDING_TOP),
@@ -2851,6 +3394,73 @@ impl eframe::App for LauncherApp {
                     layout::CONTENT_PADDING_BOTTOM,
                 ),
         );
+
+        if self.mcp.open || self.skills.open || self.about.open {
+            let panel_rect = mcp_ui::panel_rect(content_rect, status_rect);
+            let clients_busy = ClientTarget::ALL.into_iter().any(|target| {
+                self.client_connect_pending(target)
+                    || self.is_running(TaskKind::AccountMode(target))
+                    || self.is_running(TaskKind::GatewayUpdate(target))
+            });
+            if self.about.open {
+                self.about
+                    .render(ui, panel_rect, &self.providers, &self.assets.providers);
+            } else if self.skills.open {
+                self.skills.render(
+                    ui,
+                    panel_rect,
+                    &self.assets,
+                    clients_busy || self.mcp.writing(),
+                );
+            } else {
+                self.mcp.render(
+                    ui,
+                    panel_rect,
+                    &self.assets,
+                    clients_busy || self.skills.writing(),
+                );
+            }
+            if self.mcp.open || self.skills.open || self.about.open {
+                self.status = if self.about.open {
+                    i18n::tr("关于", "About").into()
+                } else if self.skills.open {
+                    self.skills.status.clone()
+                } else {
+                    self.mcp.status.clone()
+                };
+                self.status_is_warning = if self.about.open {
+                    false
+                } else if self.skills.open {
+                    self.skills.warning
+                } else {
+                    self.mcp.warning
+                };
+                self.model_list_selection_status = None;
+            } else {
+                self.status = if self.client_selected {
+                    selected_client_status(
+                        self.selected,
+                        self.client_is_installed(self.selected),
+                        self.client_is_running(self.selected),
+                        self.client_is_attached(self.selected),
+                    )
+                } else {
+                    default_status().to_owned()
+                };
+                self.status_is_warning = false;
+            }
+            render_status_bar(ui, status_rect, self);
+            if self.show_logs {
+                self.show_logs = render_log_window(
+                    ui.ctx(),
+                    window_rect,
+                    self.log_view,
+                    &self.log_text,
+                    &self.model_log_text,
+                );
+            }
+            return;
+        }
 
         // 区块 1：两行输入框都从同一个起点手工计算，横向和纵向 gap 不再经过不同的布局路径。
         let first_input_rect = Rect::from_min_size(
@@ -2919,11 +3529,7 @@ impl eframe::App for LauncherApp {
             first_input_rect,
             &self.assets.url,
             &mut self.gateway_url_display,
-            if crate::gateway::DEFAULT_GATEWAY_URL.is_empty() {
-                "https://api-endpoint"
-            } else {
-                crate::gateway::DEFAULT_GATEWAY_URL
-            },
+            "https://api-endpoint",
             false,
             None,
             Some((&mut self.show_history, &self.assets.history_expand)),
@@ -2980,14 +3586,16 @@ impl eframe::App for LauncherApp {
             self.refresh_gateway_display();
         }
         if gateway_url_changed || api_key_changed {
+            self.model_list_selection_status = None;
             self.restore_conversion_setting();
             self.mark_preferences_dirty();
             ui.ctx().request_repaint_after(INPUT_AUTOSAVE_DELAY);
         }
         self.maybe_autosave_preferences();
-        // Same left-to-right order as the client cards. Configuration identity
-        // includes both the real URL and Key, never the editable display name.
-        let active_branches = ClientTarget::ALL.map(|target| self.configuration_is_current(target));
+        // Keep each branch green for a running client connected to the gateway,
+        // regardless of whether its saved endpoint and key match the current inputs.
+        let active_branches = ClientTarget::ALL
+            .map(|target| self.client_is_running(target) && self.client_is_attached(target));
         paint_input_connection_flow(
             ui,
             first_input_rect,
@@ -3037,7 +3645,6 @@ impl eframe::App for LauncherApp {
         render_model_source_and_launch_at(ui, model_actions_rect, self);
 
         render_divider(ui, divider_bottom_rect);
-        render_status_bar(ui, status_rect, self);
 
         let history_anchor = Rect::from_min_max(
             first_input_rect.min,
@@ -3060,6 +3667,7 @@ impl eframe::App for LauncherApp {
             Vec2::splat(layout::INPUT_ACTION_SIZE),
         );
         self.render_models_menu(ui.ctx(), history_anchor, models_anchor);
+        render_status_bar(ui, status_rect, self);
 
         maybe_write_layout_probe(
             ui,
@@ -3120,15 +3728,15 @@ fn render_log_window(
         .min((window_rect.height() - layout::LOG_WINDOW_MARGIN * 2.0).max(1.0));
     let log_text = if matches!(view, LogView::Runtime) {
         if runtime_text.trim().is_empty() {
-            i18n::tr("暂无运行日志。", "No runtime logs yet.").to_owned()
+            i18n::tr("暂无运行日志。", "No runtime logs yet.")
         } else {
-            compact_runtime_log(runtime_text)
+            runtime_text
         }
     } else {
         if model_text.trim().is_empty() {
-            i18n::tr("暂无请求日志。", "No request logs yet.").to_owned()
+            i18n::tr("暂无请求日志。", "No request logs yet.")
         } else {
-            model_text.to_owned()
+            model_text
         }
     };
     let title = if matches!(view, LogView::Runtime) {
@@ -3222,7 +3830,7 @@ fn render_log_window(
         let mut selectable_log = log_text;
         let viewport = Vec2::new(
             ui.available_width() + f32::from(layout::SCROLLBAR_GUTTER),
-            body_height,
+            body_height + f32::from(layout::SCROLLBAR_GUTTER).min(padding),
         );
         let scroll_rect = Rect::from_min_size(egui::pos2(header_rect.left(), body_top), viewport);
         let mut scroll_ui = ui.new_child(egui::UiBuilder::new().max_rect(scroll_rect));
@@ -3233,6 +3841,12 @@ fn render_log_window(
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .auto_shrink([false, false])
             .stick_to_bottom(matches!(view, LogView::Runtime))
+            .content_margin(egui::Margin {
+                left: 0,
+                top: 0,
+                right: layout::SCROLLBAR_GUTTER,
+                bottom: layout::SCROLLBAR_GUTTER + layout::SCROLLBAR_HOVER_WIDTH.ceil() as i8 + 2,
+            })
             .show(&mut scroll_ui, |ui| {
                 let row_count = selectable_log.lines().count().max(1);
                 let log_font = FontId::monospace(11.0);
@@ -3346,7 +3960,9 @@ fn render_log_window(
                 if matches!(view, LogView::Model) {
                     text_edit = text_edit.layouter(&mut log_layouter);
                 }
-                let response = ui.add(text_edit);
+                let id = ui.id().with("selectable-log-text");
+                let output = text_edit.id(id).show(ui);
+                let response = text_menu::attach_read_only(ui, output, selectable_log);
 
                 // egui's text selection requests a scroll on selection
                 // changes, but it does not continuously follow the
@@ -3389,13 +4005,57 @@ fn render_log_window(
     open
 }
 
-fn compact_runtime_log(text: &str) -> String {
-    // Keep the section headers, body lines, blank lines and separators intact.
-    // Long individual lines are handled by the log window's horizontal scroll area.
-    text.to_owned()
+fn log_menu_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(
+            layout::LOG_MENU_BG[0],
+            layout::LOG_MENU_BG[1],
+            layout::LOG_MENU_BG[2],
+        ))
+        .inner_margin(egui::Margin::same(layout::LOG_MENU_PADDING as i8))
+        .corner_radius(layout::LOG_MENU_CORNER_RADIUS)
+        .shadow(egui::epaint::Shadow::NONE)
+        .stroke(Stroke::NONE)
+}
+
+fn log_menu_button(ui: &mut egui::Ui, label: &str, width: f32, enabled: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, layout::LOG_MENU_BUTTON_HEIGHT),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let bg = layout::LOG_MENU_BUTTON_BG;
+    ui.painter().rect_filled(
+        rect,
+        layout::LOG_MENU_BUTTON_RADIUS,
+        if enabled && response.hovered() {
+            ORANGE
+        } else {
+            Color32::from_rgb(bg[0], bg[1], bg[2])
+        },
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(layout::LOG_MENU_BUTTON_FONT_SIZE),
+        if enabled { TEXT_MAIN } else { TEXT_MUTED },
+    );
+    enabled && response.clicked()
 }
 
 fn model_log_time_hms(started_ms: i64) -> (u16, u16, u16) {
+    #[cfg(target_os = "macos")]
+    if let Some(local) = crate::platform::local_time(started_ms) {
+        return (
+            local.tm_hour as u16,
+            local.tm_min as u16,
+            local.tm_sec as u16,
+        );
+    }
     #[cfg(windows)]
     {
         const WINDOWS_EPOCH_UNIX_MS: i128 = 11_644_473_600_000;
@@ -3550,48 +4210,127 @@ fn render_log_header(ui: &mut egui::Ui, rect: Rect, view: LogView) -> bool {
         FontId::proportional(layout::LOG_WINDOW_TITLE_FONT_SIZE),
         TEXT_MAIN,
     );
-    let close_rect = Rect::from_center_size(
-        egui::pos2(
-            rect.right() - layout::LOG_CLOSE_BUTTON_SIZE / 2.0,
-            rect.center().y,
+    let back_rect = Rect::from_center_size(
+        egui::pos2(rect.left() + layout::PANEL_BACK_SIZE / 2.0, rect.center().y),
+        Vec2::splat(layout::PANEL_BACK_SIZE),
+    );
+    mcp_ui::back_button(ui, back_rect, "runtime-log-close")
+}
+
+fn connection_details_for_client(target: ClientTarget) -> Result<Option<(String, String)>> {
+    match target {
+        ClientTarget::CodexCli | ClientTarget::CodexDesktop => {
+            local_gateway::connection_details(target)
+        }
+        ClientTarget::ClaudeCode => {
+            let paths = crate::config::ClientPaths::discover(None, None)?;
+            crate::config::claude_code_connection_details(&paths)
+        }
+        ClientTarget::ClaudeDesktop => crate::claude_desktop_registry::connection_details(),
+    }
+}
+
+fn configuration_directory_for_client(target: ClientTarget) -> Result<PathBuf> {
+    Ok(match target {
+        ClientTarget::CodexCli => {
+            crate::config::ClientPaths::launcher_codex_cli_profile()?.codex_home
+        }
+        ClientTarget::CodexDesktop => crate::config::ClientPaths::discover(None, None)?.codex_home,
+        ClientTarget::ClaudeCode => crate::config::ClientPaths::discover(None, None)?.claude_home,
+        ClientTarget::ClaudeDesktop => crate::claude_desktop_registry::configuration_directory()?,
+    })
+}
+
+fn client_card_context_menu(
+    response: &egui::Response,
+    target: ClientTarget,
+    attached: bool,
+) -> Option<ConnectionActionResult> {
+    let mut action = None;
+    let menu = egui::Popup::context_menu(response)
+        .frame(log_menu_frame())
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            let directory_available = configuration_directory_for_client(target)
+                .is_ok_and(|directory| directory.is_dir());
+            action = client_card_context_menu_items(ui, directory_available, attached);
+        });
+    if let Some(menu) = menu {
+        paint_surface_outline(
+            &response.ctx.layer_painter(menu.response.layer_id),
+            menu.response.rect,
+            layout::LOG_MENU_CORNER_RADIUS,
+        );
+    }
+    action.map(|action| {
+        let result = match action {
+            ConnectionAction::OpenDirectory => configuration_directory_for_client(target)
+                .and_then(|directory| crate::platform::open_directory(&directory)),
+            ConnectionAction::CopyToken => {
+                // Recheck attachment at click time so a closed client cannot expose stale credentials.
+                if !attached || !local_gateway::is_attached(target) {
+                    Err(anyhow::anyhow!(i18n::tr(
+                        "客户端尚未接入",
+                        "Client is not connected"
+                    )))
+                } else {
+                    connection_details_for_client(target).and_then(|connection| {
+                        let (base_url, token) = connection
+                            .context(i18n::tr("未找到连接令牌", "Connection token not found"))?;
+                        response
+                            .ctx
+                            .copy_text(format!("Base URL: {base_url}\nToken: {token}"));
+                        Ok(())
+                    })
+                }
+            }
+        };
+        ConnectionActionResult {
+            action,
+            error: result.err().map(|error| error.to_string()),
+        }
+    })
+}
+
+fn client_card_context_menu_items(
+    ui: &mut egui::Ui,
+    directory_available: bool,
+    attached: bool,
+) -> Option<ConnectionAction> {
+    let labels = [
+        i18n::tr("打开配置目录", "Open configuration directory"),
+        i18n::tr("复制连接令牌", "Copy connection token"),
+    ];
+    let width = labels
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(
+                    (*label).to_owned(),
+                    FontId::proportional(layout::LOG_MENU_BUTTON_FONT_SIZE),
+                    TEXT_MAIN,
+                )
+                .size()
+                .x
+                + 16.0
+        })
+        .fold(0.0_f32, f32::max);
+    ui.set_width(width);
+    ui.spacing_mut().item_spacing.y = layout::LOG_MENU_BUTTON_GAP;
+    for (action, label, enabled) in [
+        (
+            ConnectionAction::OpenDirectory,
+            labels[0],
+            directory_available,
         ),
-        Vec2::splat(layout::LOG_CLOSE_BUTTON_SIZE),
-    );
-    let response = ui
-        .interact(
-            close_rect,
-            ui.id().with("runtime-log-close"),
-            Sense::click(),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    ui.painter().rect_filled(
-        close_rect,
-        layout::LOG_CLOSE_BUTTON_RADIUS,
-        if response.hovered() {
-            Color32::from_rgb(
-                layout::LOG_CLOSE_HOVER_BG[0],
-                layout::LOG_CLOSE_HOVER_BG[1],
-                layout::LOG_CLOSE_HOVER_BG[2],
-            )
-        } else {
-            Color32::from_rgb(
-                layout::LOG_CLOSE_BG[0],
-                layout::LOG_CLOSE_BG[1],
-                layout::LOG_CLOSE_BG[2],
-            )
-        },
-    );
-    let glyph = Rect::from_center_size(
-        close_rect.center(),
-        Vec2::splat(layout::LOG_CLOSE_ICON_SIZE),
-    );
-    let stroke = Stroke::new(layout::LOG_CLOSE_ICON_STROKE, TEXT_MAIN);
-    ui.painter()
-        .line_segment([glyph.left_top(), glyph.right_bottom()], stroke);
-    ui.painter()
-        .line_segment([glyph.right_top(), glyph.left_bottom()], stroke);
-    show_hover_tooltip(&response, i18n::tr("关闭", "Close"));
-    response.clicked()
+        (ConnectionAction::CopyToken, labels[1], attached),
+    ] {
+        if log_menu_button(ui, label, width, enabled) {
+            ui.close();
+            return Some(action);
+        }
+    }
+    None
 }
 
 fn input_surface_bg_color() -> Color32 {
@@ -3621,36 +4360,84 @@ fn menu_frame_margin() -> egui::Margin {
     }
 }
 
-fn paint_provider_section_title(ui: &mut egui::Ui, title: &str, line_length: f32, bottom_gap: f32) {
+fn paint_provider_section_title(
+    ui: &mut egui::Ui,
+    title: &str,
+    line_length: f32,
+    top_gap: f32,
+    bottom_gap: f32,
+) {
+    ui.add_space(top_gap);
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), layout::PROVIDER_TITLE_HEIGHT),
         Sense::hover(),
     );
-    let galley = ui.painter().layout_no_wrap(
-        title.to_owned(),
-        FontId::proportional(layout::PROVIDER_TITLE_FONT_SIZE),
+    paint_section_title_at(
+        ui,
+        rect,
+        title,
+        layout::PROVIDER_TITLE_FONT_SIZE,
+        line_length,
+        false,
+    );
+    ui.add_space(bottom_gap);
+}
+
+fn paint_section_title_at(
+    ui: &egui::Ui,
+    rect: Rect,
+    title: &str,
+    size: f32,
+    line_length: f32,
+    dashed: bool,
+) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(title.into(), FontId::proportional(size), TEXT_MUTED);
+    let text_rect = Rect::from_center_size(rect.center(), galley.size());
+    let gap = layout::SECTION_TITLE_LINE_GAP;
+    let length = line_length.min(((rect.width() - text_rect.width()) / 2.0 - gap).max(0.0));
+    let [r, g, b, a] = layout::SECTION_TITLE_LINE_COLOR;
+    let stroke = Stroke::new(
+        layout::SECTION_TITLE_LINE_WIDTH,
+        Color32::from_rgba_unmultiplied(r, g, b, a),
+    );
+    for (left, right) in [
+        (text_rect.left() - gap - length, text_rect.left() - gap),
+        (text_rect.right() + gap, text_rect.right() + gap + length),
+    ] {
+        if dashed {
+            let mut x = left;
+            while x < right {
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(x, rect.center().y),
+                        egui::pos2((x + 3.0).min(right), rect.center().y),
+                    ],
+                    stroke,
+                );
+                x += 5.0;
+            }
+        } else {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(left, rect.center().y),
+                    egui::pos2(right, rect.center().y),
+                ],
+                stroke,
+            );
+        }
+    }
+    let visible_center = if galley.mesh_bounds.is_positive() {
+        galley.mesh_bounds.center().y
+    } else {
+        galley.size().y / 2.0
+    };
+    ui.painter().galley(
+        egui::pos2(text_rect.left(), rect.center().y - visible_center),
+        galley,
         TEXT_MUTED,
     );
-    let text_rect = Rect::from_center_size(rect.center(), galley.size());
-    let [r, g, b, a] = layout::PROVIDER_TITLE_LINE_COLOR;
-    let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(r, g, b, a));
-    let y = rect.center().y;
-    ui.painter().line_segment(
-        [
-            egui::pos2(text_rect.left() - 8.0 - line_length, y),
-            egui::pos2(text_rect.left() - 8.0, y),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(text_rect.right() + 8.0, y),
-            egui::pos2(text_rect.right() + 8.0 + line_length, y),
-        ],
-        stroke,
-    );
-    ui.painter().galley(text_rect.min, galley, TEXT_MUTED);
-    ui.add_space(bottom_gap);
 }
 
 fn provider_column_count(width: f32, count: usize) -> usize {
@@ -3740,6 +4527,52 @@ fn paint_window_background(ui: &egui::Ui, rect: Rect) {
     );
 }
 
+fn content_background_mesh(
+    rect: Rect,
+    positioning_rect: Rect,
+    texture: &TextureHandle,
+) -> egui::Mesh {
+    // CSS background-attachment: fixed positions the image against the viewport.
+    // Preserve its aspect ratio with cover, then clip it to the content mask.
+    let image_size = texture.size_vec2();
+    let scale =
+        (positioning_rect.width() / image_size.x).max(positioning_rect.height() / image_size.y);
+    let image_rect = Rect::from_center_size(positioning_rect.center(), image_size * scale);
+    let uv = Rect::from_min_max(
+        ((rect.min - image_rect.min) / image_rect.size()).to_pos2(),
+        ((rect.max - image_rect.min) / image_rect.size()).to_pos2(),
+    );
+    let fade_end = 0.9;
+    let fade_rect = Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.right(), rect.top() + rect.height() * fade_end),
+    );
+    let fade_uv = Rect::from_min_max(
+        uv.min,
+        egui::pos2(uv.right(), uv.top() + uv.height() * fade_end),
+    );
+    let mut mesh = egui::Mesh::with_texture(texture.id());
+    mesh.add_rect_with_uv(fade_rect, fade_uv, Color32::WHITE);
+    // The default CSS mask uses alpha: rgb(48 48 48) is fully opaque.
+    // Interpolate to transparent at 90%; the remaining 10% is not painted.
+    mesh.vertices[2].color = Color32::TRANSPARENT;
+    mesh.vertices[3].color = Color32::TRANSPARENT;
+    mesh
+}
+
+fn paint_content_background(
+    ui: &egui::Ui,
+    rect: Rect,
+    positioning_rect: Rect,
+    texture: &TextureHandle,
+) {
+    if rect.is_positive() && positioning_rect.is_positive() {
+        ui.painter()
+            .with_clip_rect(ui.clip_rect().intersect(rect))
+            .add(content_background_mesh(rect, positioning_rect, texture));
+    }
+}
+
 const BORDER: Color32 = Color32::from_rgb(73, 75, 84);
 const TEXT_MAIN: Color32 = Color32::from_rgb(242, 243, 245);
 const TEXT_MUTED: Color32 = Color32::from_rgb(160, 166, 176);
@@ -3755,9 +4588,8 @@ fn launch_button_bg() -> Color32 {
 }
 const GREEN: Color32 = Color32::from_rgb(0, 221, 112);
 const NOT_INSTALLED: Color32 = Color32::from_rgb(255, 61, 0);
+const STATUS_WARNING_TEXT: Color32 = Color32::from_rgb(255, 179, 107);
 const MODEL_MODE_STATUS: Color32 = Color32::from_rgb(25, 93, 255);
-const SUBTITLE_LINK: Color32 = Color32::from_rgb(25, 93, 255);
-const SUBTITLE_LINK_HOVER: Color32 = Color32::from_rgb(155, 255, 0);
 
 fn default_status() -> &'static str {
     i18n::tr(
@@ -3776,7 +4608,7 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
     let logo_rect = Rect::from_center_size(
         egui::pos2(
             content_rect.left() + layout::HEADER_LOGO_WIDTH / 2.0,
-            content_center_y + layout::HEADER_LOGO_OFFSET_Y,
+            content_center_y + layout::ACTIVE_HEADER_LOGO_OFFSET_Y,
         ),
         Vec2::new(layout::HEADER_LOGO_WIDTH, layout::HEADER_LOGO_HEIGHT),
     );
@@ -3792,7 +4624,7 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
         ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
     }
     if logo_response.clicked() {
-        open_external_link(ui.ctx(), LOGO_URL);
+        open_external_link(ui.ctx(), localized_header_url(LOGO_URL, i18n::language()));
     }
 
     let dot_size = Vec2::splat(layout::HEADER_TRAFFIC_DOT_SIZE);
@@ -3810,38 +4642,21 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
     // 标题两行使用显式行高，整个文字块在标题栏内容区中严格垂直居中。
     let title_left = logo_rect.right() + layout::HEADER_LOGO_TITLE_GAP;
     let title_block_top = content_center_y - layout::HEADER_TITLE_BLOCK_HEIGHT / 2.0
-        + layout::HEADER_TITLE_BLOCK_OFFSET_Y;
+        + layout::ACTIVE_HEADER_TITLE_BLOCK_OFFSET_Y;
     let main_center_y = title_block_top + layout::HEADER_TITLE_MAIN_LINE_HEIGHT / 2.0;
     let subtitle_center_y = title_block_top
         + layout::HEADER_TITLE_MAIN_LINE_HEIGHT
-        + layout::HEADER_TITLE_LINES_GAP
+        + layout::ACTIVE_HEADER_TITLE_LINES_GAP
         + layout::HEADER_TITLE_SUBTITLE_LINE_HEIGHT / 2.0;
     ui.painter().text(
         egui::pos2(title_left, main_center_y),
         Align2::LEFT_CENTER,
-        WINDOW_TITLE,
+        window_title(),
         FontId::proportional(layout::HEADER_TITLE_MAIN_FONT_SIZE),
         TEXT_MAIN,
     );
-    let chinese = i18n::language() == i18n::Language::ZhCn;
     let subtitle_font = FontId::proportional(11.0);
-    let subtitle_link_font = FontId::proportional(11.0);
-    let subtitle_prefix = if crate::gateway::CUSTOM_EDITION {
-        if chinese {
-            "让一切变的简单"
-        } else {
-            "znnz.net"
-        }
-    } else if chinese {
-        "让一切变的简单"
-    } else {
-        "Simplify everything"
-    };
-    let subtitle_link = if chinese {
-        "获取密钥"
-    } else {
-        "Get api key"
-    };
+    let subtitle_prefix = i18n::tr("免费 • 轻量 • AI 网关管理器", "Light AI Gateway Manager");
     let subtitle_separator = " • ";
     let subtitle_prefix_galley = ui.painter().layout_no_wrap(
         subtitle_prefix.to_owned(),
@@ -3864,69 +4679,7 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
         egui::pos2(title_left, subtitle_center_y - subtitle_prefix_size.y / 2.0),
         subtitle_prefix_size,
     );
-    let mut subtitle_cursor = subtitle_text_rect.right();
-    if crate::gateway::CUSTOM_EDITION
-        && let Some(key_page_url) = crate::gateway::KEY_PAGE_URL.filter(|url| !url.is_empty())
-    {
-        ui.painter().galley(
-            egui::pos2(
-                subtitle_cursor,
-                subtitle_center_y - subtitle_separator_size.y / 2.0,
-            ),
-            subtitle_separator_galley.clone(),
-            TEXT_MUTED,
-        );
-        subtitle_cursor += subtitle_separator_size.x;
-        let subtitle_link_size = ui
-            .painter()
-            .layout_no_wrap(
-                subtitle_link.to_owned(),
-                subtitle_link_font.clone(),
-                SUBTITLE_LINK,
-            )
-            .size();
-        let subtitle_link_text_rect = Rect::from_min_size(
-            egui::pos2(
-                subtitle_cursor,
-                subtitle_center_y - subtitle_link_size.y / 2.0,
-            ),
-            subtitle_link_size,
-        );
-        let subtitle_link_rect = Rect::from_min_max(
-            subtitle_link_text_rect.min,
-            egui::pos2(
-                subtitle_link_text_rect.right(),
-                subtitle_link_text_rect.bottom() + 3.0,
-            ),
-        );
-        let subtitle_link_response = ui.interact(
-            subtitle_link_rect,
-            ui.id().with("header-subtitle-link"),
-            Sense::click(),
-        );
-        let subtitle_link_color = if subtitle_link_response.hovered() {
-            SUBTITLE_LINK_HOVER
-        } else {
-            SUBTITLE_LINK
-        };
-        let subtitle_link_paint_galley = ui.painter().layout_no_wrap(
-            subtitle_link.to_owned(),
-            subtitle_link_font,
-            subtitle_link_color,
-        );
-        ui.painter().galley(
-            subtitle_link_text_rect.min,
-            subtitle_link_paint_galley,
-            subtitle_link_color,
-        );
-        if subtitle_link_response.hovered() {
-            ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
-        }
-        if subtitle_link_response.clicked() {
-            open_external_link(ui.ctx(), key_page_url);
-        }
-        subtitle_cursor = subtitle_link_rect.right();
-    }
+    let subtitle_cursor = subtitle_text_rect.right();
 
     let first_separator_pos = egui::pos2(
         subtitle_cursor,
@@ -3942,7 +4695,7 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
             first_separator_pos.x
                 + subtitle_separator_size.x
                 + layout::HEADER_SUBTITLE_ICON_SIZE / 2.0,
-            subtitle_center_y + layout::HEADER_SUBTITLE_ICON_OFFSET_Y,
+            subtitle_center_y + layout::ACTIVE_HEADER_SUBTITLE_ICON_OFFSET_Y,
         ),
         Vec2::splat(layout::HEADER_SUBTITLE_ICON_SIZE),
     );
@@ -3962,7 +4715,7 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
         ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
     }
     if update_response.clicked() {
-        open_external_link(ui.ctx(), UPDATE_URL);
+        open_external_link(ui.ctx(), localized_header_url(UPDATE_URL, i18n::language()));
     }
     show_hover_tooltip(&update_response, i18n::tr("检查更新", "Check for updates"));
 
@@ -3980,7 +4733,7 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
             second_separator_pos.x
                 + subtitle_separator_size.x
                 + layout::HEADER_SUBTITLE_ICON_SIZE / 2.0,
-            subtitle_center_y + layout::HEADER_SUBTITLE_ICON_OFFSET_Y,
+            subtitle_center_y + layout::ACTIVE_HEADER_SUBTITLE_ICON_OFFSET_Y,
         ),
         Vec2::splat(layout::HEADER_SUBTITLE_ICON_SIZE),
     );
@@ -4000,7 +4753,7 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
         ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
     }
     if github_response.clicked() {
-        open_external_link(ui.ctx(), GITHUB_URL);
+        open_external_link(ui.ctx(), localized_header_url(GITHUB_URL, i18n::language()));
     }
     show_hover_tooltip(&github_response, "GitHub");
 
@@ -4020,7 +4773,7 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
         let rect = Rect::from_min_size(
             egui::pos2(
                 links_right + subtitle_separator_size.x,
-                subtitle_center_y + layout::HEADER_SUBTITLE_ICON_OFFSET_Y
+                subtitle_center_y + layout::ACTIVE_HEADER_SUBTITLE_ICON_OFFSET_Y
                     - layout::HEADER_SUBTITLE_ICON_SIZE / 2.0,
             ),
             Vec2::splat(layout::HEADER_SUBTITLE_ICON_SIZE),
@@ -4037,7 +4790,7 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
             ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
         }
         if response.clicked() {
-            open_external_link(ui.ctx(), url);
+            open_external_link(ui.ctx(), localized_header_url(url, i18n::language()));
         }
         show_hover_tooltip(&response, tooltip);
         links_right = rect.right();
@@ -4106,7 +4859,12 @@ fn render_header(ui: &mut egui::Ui, assets: &GuiAssets, header_rect: Rect) {
             .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }
     if close_clicked {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        #[cfg(target_os = "macos")]
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        #[cfg(not(target_os = "macos"))]
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 }
 
@@ -4236,9 +4994,8 @@ fn render_input_row_at(
             input_rect.bottom() - 2.0,
         ),
     );
-    let edit_response = ui.put(
-        edit_rect,
-        egui::TextEdit::singleline(value)
+    let edit_response = ui.put(edit_rect, |ui: &mut egui::Ui| {
+        let output = egui::TextEdit::singleline(&mut *value)
             .password(password)
             .hint_text(RichText::new(hint).color(input_hint_text_color()))
             .font(FontId::proportional(14.0))
@@ -4246,8 +5003,18 @@ fn render_input_row_at(
             .margin(egui::Margin::ZERO)
             .frame(egui::Frame::NONE)
             .text_color(TEXT_MAIN)
-            .interactive(true),
-    );
+            .interactive(true)
+            .show(ui);
+        text_menu::attach(
+            ui,
+            output,
+            value,
+            text_menu::Options {
+                password,
+                multiline: false,
+            },
+        )
+    });
 
     if let Some((show, show_icon, hide_icon)) = visibility {
         let visibility_rect = Rect::from_center_size(
@@ -4719,20 +5486,88 @@ fn interpolate_keyframes(progress: f32, times: &[f32], values: &[f32]) -> f32 {
     }
     *values.last().unwrap_or(&0.0)
 }
+#[derive(Clone, Copy)]
+struct ClientSelectionSlide {
+    from: f32,
+    to: f32,
+    started: f64,
+}
+
+impl ClientSelectionSlide {
+    fn value(self, now: f64) -> f32 {
+        let progress = ((now - self.started) as f32 / layout::CLIENT_SELECTION_TRANSITION_SECONDS)
+            .clamp(0.0, 1.0);
+        self.from + (self.to - self.from) * client_selection_easing(progress)
+    }
+}
+
+fn client_selection_easing(progress: f32) -> f32 {
+    if progress <= 0.0 || progress >= 1.0 {
+        return progress.clamp(0.0, 1.0);
+    }
+    // CSS cubic-bezier(.2, .8, .2, 1): solve its x coordinate for time,
+    // then use the corresponding y coordinate as the travelled distance.
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..16 {
+        let t = (low + high) * 0.5;
+        let x = 0.6 * (1.0 - t) * t + t * t * t;
+        if x < progress {
+            low = t;
+        } else {
+            high = t;
+        }
+    }
+    let t = (low + high) * 0.5;
+    2.4 * (1.0 - t).powi(2) * t + 3.0 * (1.0 - t) * t * t + t * t * t
+}
+
+fn animate_client_selection(ctx: &egui::Context, id: egui::Id, target: f32) -> f32 {
+    let now = ctx.input(|input| input.time);
+    let slide = ctx.data_mut(|data| {
+        let mut slide = data
+            .get_temp::<ClientSelectionSlide>(id)
+            .unwrap_or(ClientSelectionSlide {
+                from: target,
+                to: target,
+                started: now,
+            });
+        if slide.to != target {
+            slide = ClientSelectionSlide {
+                from: slide.value(now),
+                to: target,
+                started: now,
+            };
+        }
+        data.insert_temp(id, slide);
+        slide
+    });
+    if slide.from != slide.to
+        && now - slide.started < f64::from(layout::CLIENT_SELECTION_TRANSITION_SECONDS)
+    {
+        ctx.request_repaint();
+    }
+    slide.value(now)
+}
+
 fn render_client_selector_at(ui: &mut egui::Ui, panel_rect: Rect, app: &mut LauncherApp) {
     let cards_rect = panel_rect.shrink(layout::CLIENT_PANEL_PADDING);
     let painter = ui.painter();
 
     if app.client_selected {
-        // 选中卡片对应位置在区块 2-1 底部显示洋红色缺口标记。
+        // 选中卡片对应位置在区块 2-1 底部显示绿色滑块。
         let selected_index = ClientTarget::ALL
             .into_iter()
             .position(|target| target == app.selected)
             .unwrap_or(0);
-        let selected_center_x = cards_rect.left()
+        let target_center_x = cards_rect.left()
             + layout::CLIENT_CARD_WIDTH / 2.0
             + selected_index as f32
                 * (layout::CLIENT_CARD_WIDTH + layout::CLIENT_CARD_HORIZONTAL_GAP);
+        let selected_center_x = animate_client_selection(
+            ui.ctx(),
+            ui.id().with("client-selection-notch"),
+            target_center_x,
+        );
         let notch_rect = Rect::from_min_size(
             egui::pos2(
                 selected_center_x - layout::CLIENT_SELECTED_NOTCH_WIDTH / 2.0,
@@ -4744,7 +5579,7 @@ fn render_client_selector_at(ui: &mut egui::Ui, panel_rect: Rect, app: &mut Laun
             ),
         );
 
-        // 使用三个裁剪区域绘制同一个圆角面板，中间区域由洋红色缺口标记填充。
+        // 使用三个裁剪区域绘制同一个圆角面板，中间区域由绿色滑块填充。
         painter
             .with_clip_rect(Rect::from_min_max(
                 panel_rect.min,
@@ -4809,7 +5644,7 @@ fn render_client_selector_at(ui: &mut egui::Ui, panel_rect: Rect, app: &mut Laun
                     .map(|(_, fingerprint)| fingerprint.as_str());
                 connected_configuration_name(&app.history, fingerprint, url).to_owned()
             });
-        let clicked = render_client_card_at(
+        let response = render_client_card_at(
             ui,
             card_rect,
             target,
@@ -4820,19 +5655,22 @@ fn render_client_selector_at(ui: &mut egui::Ui, panel_rect: Rect, app: &mut Laun
             connected_endpoint.as_deref(),
             &app.assets,
         );
-        if clicked {
+        if response.clicked() {
             let running = app.client_is_running(target);
             let installed = app.client_is_installed(target);
             let attached = app.client_is_attached(target);
             app.remember_client_inputs();
             app.selected = target;
             app.client_selected = true;
+            app.model_list_selection_status = None;
             app.select_client_configuration(target);
             app.mark_preferences_dirty();
             ui.ctx().request_repaint_after(INPUT_AUTOSAVE_DELAY);
             app.status = selected_client_status(target, installed, running, attached);
             app.status_is_warning = false;
         }
+        let action = client_card_context_menu(&response, target, app.client_is_attached(target));
+        app.apply_connection_action(target, action);
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -4846,7 +5684,7 @@ fn render_client_card_at(
     attached: bool,
     connected_endpoint: Option<&str>,
     assets: &GuiAssets,
-) -> bool {
+) -> egui::Response {
     let size = rect.size();
     let response = ui.interact(
         rect,
@@ -4864,10 +5702,7 @@ fn render_client_card_at(
 
     let icon = assets.client_icon(target);
     let badge = assets.client_badge(target);
-    let icon_rect = Rect::from_center_size(
-        rect.center() + egui::vec2(0.0, -2.0),
-        Vec2::splat(size.x.min(size.y) * 0.60),
-    );
+    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(size.x.min(size.y) * 0.60));
     paint_svg_texture(
         ui,
         icon,
@@ -4891,15 +5726,17 @@ fn render_client_card_at(
     let dot_center = rect.right_bottom() + egui::vec2(-5.0, -7.0);
     paint_client_status_dot(ui, dot_center, installed, running, attached);
 
-    show_client_card_tooltip(
-        &response,
-        target,
-        installed,
-        running,
-        attached,
-        connected_endpoint,
-    );
-    response.clicked()
+    if !egui::Popup::context_menu(&response).is_open() {
+        show_client_card_tooltip(
+            &response,
+            target,
+            installed,
+            running,
+            attached,
+            connected_endpoint,
+        );
+    }
+    response
 }
 
 fn paint_connection_dot(ui: &egui::Ui, dot_center: egui::Pos2, attached: bool) {
@@ -5029,78 +5866,75 @@ fn render_model_source_and_launch_at(ui: &mut egui::Ui, row_rect: Rect, app: &mu
     let target = app.selected;
     let has_selected_client = app.client_selected;
     let selected_mode = app.model_list_mode(target);
-    let locked =
-        !has_selected_client || (app.client_is_running(target) && app.client_is_attached(target));
+    let locked = !has_selected_client
+        || app.mcp.writing()
+        || app.skills.writing()
+        || app.client_connect_pending(target)
+        || app.is_running(TaskKind::AccountMode(target))
+        || app.is_running(TaskKind::GatewayUpdate(target));
 
-    // 区块 2-2 左侧的两个模型列表按钮按内容宽度占位，类似 CSS 的
-    // height + padding；不会再平均拉伸填满整行。
-    let built_in_label = model_mode_label(ModelListMode::BuiltIn);
-    let gateway_label = model_mode_label(ModelListMode::Gateway);
-    let built_in_width = choice_chip_width(ui, built_in_label);
-    let gateway_width = choice_chip_width(ui, gateway_label);
-
-    let built_in_rect = Rect::from_min_size(
-        egui::pos2(row_rect.left(), center_y - layout::MODEL_CHIP_HEIGHT / 2.0),
-        Vec2::new(built_in_width, layout::MODEL_CHIP_HEIGHT),
-    );
-    let gateway_rect = Rect::from_min_size(
-        egui::pos2(
-            built_in_rect.right() + layout::MODEL_CHIP_HORIZONTAL_GAP,
-            center_y - layout::MODEL_CHIP_HEIGHT / 2.0,
-        ),
-        Vec2::new(gateway_width, layout::MODEL_CHIP_HEIGHT),
-    );
-
-    // 启动按钮贴着区块 2-2 右边缘；安装按钮在其左侧保留可配置间距。
     let launch_rect = Rect::from_center_size(
         egui::pos2(row_rect.right() - layout::MODEL_LAUNCH_SIZE / 2.0, center_y),
         Vec2::splat(layout::MODEL_LAUNCH_SIZE),
     );
-    let install_rect = Rect::from_center_size(
-        egui::pos2(
-            launch_rect.left()
-                - layout::MODEL_INSTALL_LAUNCH_GAP
-                - layout::MODEL_INSTALL_SIZE / 2.0,
-            center_y,
-        ),
-        Vec2::splat(layout::MODEL_INSTALL_SIZE),
-    );
-
-    if choice_chip_at(
+    let step = layout::MODEL_INSTALL_SIZE + layout::MODEL_INSTALL_LAUNCH_GAP;
+    let models_rect = launch_rect.translate(egui::vec2(-step, 0.0));
+    let install_rect = models_rect.translate(egui::vec2(-step, 0.0));
+    let mcp_rect = Rect::from_min_size(row_rect.min, Vec2::splat(layout::MODEL_INSTALL_SIZE));
+    if mcp_ui::action_button(
         ui,
-        built_in_rect,
-        built_in_label,
-        has_selected_client && selected_mode == ModelListMode::BuiltIn,
-        !locked,
-        &app.assets.select,
+        mcp_rect,
+        &app.assets.mcp,
+        "MCP Server",
+        true,
+        Color32::from_rgb(59, 59, 59),
+        true,
     ) {
-        app.set_model_list_mode(target, ModelListMode::BuiltIn);
-        app.status = selected_client_status(
-            target,
-            app.client_is_installed(target),
-            app.client_is_running(target),
-            app.client_is_attached(target),
-        );
-        app.status_is_warning = false;
+        app.show_history = false;
+        app.show_models = false;
+        app.model_list_selection_status = None;
+        app.skills.open = false;
+        app.about.open = false;
+        app.mcp.show(ui.ctx());
     }
-    if choice_chip_at(
+    if mcp_ui::action_button(
         ui,
-        gateway_rect,
-        gateway_label,
-        has_selected_client && selected_mode == ModelListMode::Gateway,
-        !locked,
-        &app.assets.select,
+        mcp_rect.translate(egui::vec2(step, 0.0)),
+        &app.assets.skills,
+        "Skills",
+        true,
+        Color32::from_rgb(59, 59, 59),
+        true,
     ) {
-        app.set_model_list_mode(target, ModelListMode::Gateway);
-        app.status = selected_client_status(
-            target,
-            app.client_is_installed(target),
-            app.client_is_running(target),
-            app.client_is_attached(target),
-        );
-        app.status_is_warning = false;
+        app.show_history = false;
+        app.show_models = false;
+        app.model_list_selection_status = None;
+        app.mcp.open = false;
+        app.about.open = false;
+        app.skills.show(ui.ctx());
     }
-
+    if mcp_ui::action_button(
+        ui,
+        mcp_rect.translate(egui::vec2(step * 2.0, 0.0)),
+        &app.assets.about,
+        i18n::tr("关于", "About"),
+        true,
+        Color32::from_rgb(59, 59, 59),
+        true,
+    ) {
+        app.show_history = false;
+        app.show_models = false;
+        app.model_list_selection_status = None;
+        app.mcp.open = false;
+        app.skills.open = false;
+        app.about.open = true;
+    }
+    if let Some(mode) =
+        mcp_ui::model_source_button(ui, models_rect, selected_mode, !locked, &app.assets)
+    {
+        app.select_model_list_mode(target, mode);
+        ui.ctx().request_repaint_after(INPUT_AUTOSAVE_DELAY);
+    }
     let selected_installed = has_selected_client && app.client_is_installed(target);
     let selected_installing = has_selected_client
         && (app.is_running(TaskKind::Install(target))
@@ -5117,6 +5951,8 @@ fn render_model_source_and_launch_at(ui: &mut egui::Ui, row_rect: Rect, app: &mu
         &app.assets.spinner,
         has_selected_client,
         has_selected_client
+            && !app.mcp.writing()
+            && !app.skills.writing()
             && (!selected_installed || managed)
             && !selected_installing
             && !app.client_connect_pending(target)
@@ -5129,6 +5965,8 @@ fn render_model_source_and_launch_at(ui: &mut egui::Ui, row_rect: Rect, app: &mu
     }
 
     let launch_enabled = has_selected_client
+        && !app.mcp.writing()
+        && !app.skills.writing()
         && !app.configuration_is_current(target)
         && !app.is_running(TaskKind::GatewayUpdate(target))
         && !app.is_running(TaskKind::AccountMode(target))
@@ -5155,80 +5993,6 @@ fn render_model_source_and_launch_at(ui: &mut egui::Ui, row_rect: Rect, app: &mu
     ) {
         app.start_selected_client();
     }
-}
-
-fn choice_chip_width(ui: &egui::Ui, label: &str) -> f32 {
-    let text_width = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), FontId::proportional(11.5), Color32::WHITE)
-        .size()
-        .x;
-    layout::MODEL_CHIP_PADDING_LEFT
-        + layout::MODEL_CHECK_WIDTH
-        + layout::MODEL_CHECK_TEXT_GAP
-        + text_width
-        + layout::MODEL_CHIP_PADDING_RIGHT
-}
-
-fn choice_chip_at(
-    ui: &mut egui::Ui,
-    rect: Rect,
-    label: &str,
-    selected: bool,
-    enabled: bool,
-    select_icon: &TextureHandle,
-) -> bool {
-    let sense = if enabled {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let response = ui.interact(rect, ui.id().with(("model-list-chip", label)), sense);
-    let fill = secondary_surface_bg_color();
-    ui.painter().rect_filled(rect, 10.0, fill);
-
-    let box_rect = Rect::from_center_size(
-        egui::pos2(
-            rect.left() + layout::MODEL_CHIP_PADDING_LEFT + layout::MODEL_CHECK_WIDTH / 2.0,
-            rect.center().y,
-        ),
-        Vec2::new(layout::MODEL_CHECK_WIDTH, layout::MODEL_CHECK_HEIGHT),
-    );
-    let check_background = if selected {
-        Color32::from_rgb(0, 39, 255)
-    } else {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 26)
-    };
-    ui.painter().rect_filled(
-        box_rect,
-        (layout::MODEL_CHECK_WIDTH.min(layout::MODEL_CHECK_HEIGHT) / 2.0).min(6.0),
-        check_background,
-    );
-    if selected {
-        let check_width = (layout::MODEL_CHECK_WIDTH - 4.0).max(1.0);
-        let check_height = (layout::MODEL_CHECK_HEIGHT - 4.0).max(1.0);
-        paint_svg_texture(
-            ui,
-            select_icon,
-            Rect::from_center_size(box_rect.center(), Vec2::new(check_width, check_height)),
-            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
-    }
-    let text_color = if enabled {
-        Color32::from_rgb(200, 206, 216)
-    } else {
-        Color32::from_gray(108)
-    };
-    let text_galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), FontId::proportional(11.5), text_color);
-    let text_pos = egui::pos2(
-        box_rect.right() + layout::MODEL_CHECK_TEXT_GAP,
-        rect.center().y - text_galley.size().y / 2.0,
-    );
-    ui.painter().galley(text_pos, text_galley, text_color);
-    response.clicked()
 }
 
 fn paint_spinner(ui: &egui::Ui, frames: &[TextureHandle], rect: Rect) {
@@ -5299,7 +6063,7 @@ fn render_install_button_at(
         show_hover_tooltip(
             &response,
             if installed {
-                i18n::tr("正在切换账号模式", "Switching account mode")
+                ClientOperation::Account.progress(i18n::language())
             } else {
                 i18n::tr("正在安装", "Installing")
             },
@@ -5309,7 +6073,11 @@ fn render_install_button_at(
     } else if managed {
         show_hover_tooltip(&response, i18n::tr("切换账号模式", "Switch account mode"));
     } else {
-        show_colored_status_tooltip(&response, i18n::tr("账号模式", "Account mode"), GREEN);
+        show_colored_status_tooltip(
+            &response,
+            i18n::tr("处于账号模式", "Account Mode Active"),
+            GREEN,
+        );
     }
     response.clicked()
 }
@@ -5364,7 +6132,22 @@ fn render_launch_button_at(
 }
 
 fn render_status_bar(ui: &mut egui::Ui, status_rect: Rect, app: &mut LauncherApp) {
-    if app.status_is_warning {
+    let now = Instant::now();
+    if app
+        .connection_action_feedback
+        .as_ref()
+        .is_some_and(|(_, expires_at, _)| *expires_at <= now)
+    {
+        app.connection_action_feedback = None;
+    }
+    let feedback = app
+        .connection_action_feedback
+        .as_ref()
+        .map(|(text, _, warning)| (text.clone(), *warning));
+    let status_is_warning = feedback
+        .as_ref()
+        .map_or(app.status_is_warning, |(_, warning)| *warning);
+    if status_is_warning {
         // 状态栏警告背景贴合窗口底边，窗口外形统一由原生 Region 裁剪。
         ui.painter().rect_filled(
             status_rect,
@@ -5373,13 +6156,13 @@ fn render_status_bar(ui: &mut egui::Ui, status_rect: Rect, app: &mut LauncherApp
         );
     }
 
-    let icon = if app.status_is_warning {
+    let icon = if status_is_warning {
         &app.assets.prompt_warn
     } else {
         &app.assets.prompt
     };
-    let color = if app.status_is_warning {
-        Color32::from_rgb(255, 179, 107)
+    let color = if status_is_warning {
+        STATUS_WARNING_TEXT
     } else {
         Color32::from_rgb(200, 206, 216)
     };
@@ -5420,7 +6203,10 @@ fn render_status_bar(ui: &mut egui::Ui, status_rect: Rect, app: &mut LauncherApp
     );
     // 直接按矩形绘制，避免嵌套 Label 自带布局占位改变图标与文字之间的可见距离。
     // “已...”显示绿色，“未...”显示橙红色。
-    let text = app.status.clone();
+    let text = feedback
+        .as_ref()
+        .map(|(text, _)| text.clone())
+        .unwrap_or_else(|| app.status.clone());
     let attached_endpoint = if !app.status_is_warning
         && text
             == selected_client_status(
@@ -5454,7 +6240,17 @@ fn render_status_bar(ui: &mut egui::Ui, status_rect: Rect, app: &mut LauncherApp
         let name = connected_configuration_name(&app.history, fingerprint, endpoint);
         Some((prefix.to_owned(), name.to_owned(), endpoint.to_owned()))
     });
-    if let Some((prefix, display, endpoint)) = endpoint_display {
+    if feedback.is_some() {
+        paint_status_text(ui, text_rect, &text, color);
+    } else if let Some(model_status) = app.visible_model_list_status() {
+        paint_model_list_selection_status(
+            ui,
+            text_rect,
+            model_status,
+            color,
+            &app.assets.select_green,
+        );
+    } else if let Some((prefix, display, endpoint)) = endpoint_display {
         paint_status_text(ui, text_rect, &prefix, color);
         let font = FontId::proportional(11.0);
         let prefix_width = ui
@@ -5536,10 +6332,22 @@ fn configuration_for_client(
     if let Some(fingerprint) = connected_fingerprint {
         if let Some(index) = history_configuration_index(history, Some(fingerprint)) {
             let entry = &history[index];
+            let conversion_enabled = configurations
+                .get(target.id())
+                .filter(|configuration| {
+                    local_gateway::configuration_fingerprint(
+                        &configuration.gateway_url,
+                        &configuration.api_key,
+                    )
+                    .is_ok_and(|value| value == fingerprint)
+                })
+                .map(|configuration| configuration.conversion_enabled)
+                .unwrap_or(entry.conversion_enabled);
             return Some(gui_settings::ClientConfiguration {
                 gateway_url: entry.gateway_url.clone(),
                 api_key: entry.api_key.clone(),
                 preset_provider: None,
+                conversion_enabled,
             });
         }
         // A removed history entry may still be remembered by its client.
@@ -5615,38 +6423,136 @@ fn paint_status_text(ui: &egui::Ui, text_rect: Rect, text: &str, default_color: 
     let regular_font = FontId::proportional(11.0);
     let highlights = status_highlight_ranges(text);
 
-    let mut cursor = 0;
-    let mut x = text_rect.left();
-    for (start, end, color) in highlights {
+    #[cfg(target_os = "macos")]
+    {
+        // A single galley keeps all color segments on the same baseline.
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = f32::INFINITY;
+        let mut cursor = 0;
+        for (start, end, color) in &highlights {
+            job.append(
+                &text[cursor..*start],
+                0.0,
+                egui::TextFormat::simple(regular_font.clone(), default_color),
+            );
+            job.append(
+                &text[*start..*end],
+                0.0,
+                egui::TextFormat::simple(regular_font.clone(), *color),
+            );
+            cursor = *end;
+        }
+        job.append(
+            &text[cursor..],
+            0.0,
+            egui::TextFormat::simple(regular_font, default_color),
+        );
+        let galley = painter.layout_job(job);
+        let position = egui::pos2(
+            text_rect.left(),
+            text_rect.center().y - galley.size().y / 2.0,
+        );
+        painter.galley(position, galley, default_color);
+        return;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut cursor = 0;
+        let mut x = text_rect.left();
+        for (start, end, color) in highlights {
+            paint_status_segment(
+                &painter,
+                &regular_font,
+                &text[cursor..start],
+                default_color,
+                text_rect,
+                &mut x,
+            );
+            paint_status_segment(
+                &painter,
+                &regular_font,
+                &text[start..end],
+                color,
+                text_rect,
+                &mut x,
+            );
+            cursor = end;
+        }
         paint_status_segment(
             &painter,
             &regular_font,
-            &text[cursor..start],
+            &text[cursor..],
             default_color,
             text_rect,
             &mut x,
         );
-        paint_status_segment(
-            &painter,
-            &regular_font,
-            &text[start..end],
-            color,
-            text_rect,
-            &mut x,
-        );
-        cursor = end;
     }
-    paint_status_segment(
-        &painter,
-        &regular_font,
-        &text[cursor..],
-        default_color,
-        text_rect,
-        &mut x,
+}
+
+fn paint_model_list_selection_status(
+    ui: &egui::Ui,
+    rect: Rect,
+    status: ModelListSelectionStatus,
+    color: Color32,
+    check_icon: &TextureHandle,
+) {
+    let text = status.text(i18n::language());
+    paint_status_text(ui, rect, &text, color);
+    if status.shows_check() {
+        paint_model_list_check(ui, rect, &text, color, check_icon);
+    }
+}
+
+fn paint_model_list_check(
+    ui: &egui::Ui,
+    rect: Rect,
+    text: &str,
+    color: Color32,
+    check_icon: &TextureHandle,
+) {
+    let painter = ui.painter().with_clip_rect(rect);
+    let text_width = painter
+        .layout_no_wrap(text.to_owned(), FontId::proportional(11.0), color)
+        .size()
+        .x;
+    let check_rect = Rect::from_center_size(
+        egui::pos2(rect.left() + text_width + 4.0 + 6.0, rect.center().y),
+        Vec2::splat(12.0),
+    );
+    painter.image(
+        check_icon.id(),
+        align_rect_to_physical_pixels(ui.ctx(), check_rect),
+        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
     );
 }
 
+fn delete_confirmation_status(name: &str) -> String {
+    format!(
+        "{name} • {}",
+        i18n::tr("再次点击确认删除", "Click again to confirm deletion")
+    )
+}
+
+fn is_delete_feedback_status(text: &str) -> bool {
+    text.rsplit_once(" • ").is_some_and(|(_, action)| {
+        matches!(
+            action,
+            "再次点击确认删除" | "Click again to confirm deletion" | "已删除" | "Deleted"
+        )
+    })
+}
+
 fn status_highlight_ranges(text: &str) -> Vec<(usize, usize, Color32)> {
+    if let Some((_, action)) = text.rsplit_once(" • ")
+        && matches!(
+            action,
+            "再次点击确认删除" | "Click again to confirm deletion"
+        )
+    {
+        return vec![(text.len() - action.len(), text.len(), NOT_INSTALLED)];
+    }
     let text = text.split(" • http").next().unwrap_or(text);
     let mut ranges = Vec::new();
     for (needle, color) in [
@@ -5656,6 +6562,7 @@ fn status_highlight_ranges(text: &str) -> Vec<(usize, usize, Color32)> {
         ("未安装", NOT_INSTALLED),
         ("未运行", NOT_INSTALLED),
         ("未连接", NOT_INSTALLED),
+        ("已删除", NOT_INSTALLED),
         ("成功连接", GREEN),
         ("成功拉取", GREEN),
         ("Installed", GREEN),
@@ -5664,11 +6571,15 @@ fn status_highlight_ranges(text: &str) -> Vec<(usize, usize, Color32)> {
         ("Not installed", NOT_INSTALLED),
         ("Connected", GREEN),
         ("Not connected", NOT_INSTALLED),
+        ("Deleted", NOT_INSTALLED),
+        ("Removed", NOT_INSTALLED),
         ("Fetched", GREEN),
         ("默认模型列表", MODEL_MODE_STATUS),
         ("网关模型列表", MODEL_MODE_STATUS),
         ("Default models", MODEL_MODE_STATUS),
         ("Gateway models", MODEL_MODE_STATUS),
+        ("重启生效", NOT_INSTALLED),
+        ("Restart to apply", NOT_INSTALLED),
         // Also color logs produced by older builds while they are still open.
         ("连接成功", GREEN),
         ("拉取成功", GREEN),
@@ -5781,66 +6692,26 @@ fn render_log_button_at(ui: &mut egui::Ui, rect: Rect, icon: &TextureHandle) -> 
             .order(egui::Order::Foreground)
             .fixed_pos(popup_rect.left_top())
             .show(ui.ctx(), |ui| {
-                let menu_bg = Color32::from_rgb(
-                    layout::LOG_MENU_BG[0],
-                    layout::LOG_MENU_BG[1],
-                    layout::LOG_MENU_BG[2],
-                );
-                let button_bg = Color32::from_rgb(
-                    layout::LOG_MENU_BUTTON_BG[0],
-                    layout::LOG_MENU_BUTTON_BG[1],
-                    layout::LOG_MENU_BUTTON_BG[2],
-                );
-                let frame = egui::Frame::new()
-                    .fill(menu_bg)
-                    .inner_margin(egui::Margin::same(layout::LOG_MENU_PADDING as i8))
-                    .corner_radius(layout::LOG_MENU_CORNER_RADIUS)
-                    .shadow(egui::epaint::Shadow::NONE)
-                    .stroke(Stroke::NONE)
-                    .show(ui, |ui| {
-                        ui.set_min_size(egui::vec2(
+                let frame = log_menu_frame().show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(
+                        layout::LOG_MENU_WIDTH - layout::LOG_MENU_PADDING * 2.0,
+                        layout::LOG_MENU_HEIGHT - layout::LOG_MENU_PADDING * 2.0,
+                    ));
+                    ui.spacing_mut().item_spacing.y = layout::LOG_MENU_BUTTON_GAP;
+                    for (view, label) in [
+                        (LogView::Runtime, i18n::tr("运行日志", "Runtime log")),
+                        (LogView::Model, i18n::tr("请求日志", "Request log")),
+                    ] {
+                        if log_menu_button(
+                            ui,
+                            label,
                             layout::LOG_MENU_WIDTH - layout::LOG_MENU_PADDING * 2.0,
-                            layout::LOG_MENU_HEIGHT - layout::LOG_MENU_PADDING * 2.0,
-                        ));
-                        ui.spacing_mut().item_spacing.y = layout::LOG_MENU_BUTTON_GAP;
-                        for (index, (view, label)) in [
-                            (LogView::Runtime, i18n::tr("运行日志", "Runtime log")),
-                            (LogView::Model, i18n::tr("请求日志", "Request log")),
-                        ]
-                        .into_iter()
-                        .enumerate()
-                        {
-                            let (button_rect, button_response) = ui.allocate_exact_size(
-                                egui::vec2(
-                                    layout::LOG_MENU_WIDTH - layout::LOG_MENU_PADDING * 2.0,
-                                    layout::LOG_MENU_BUTTON_HEIGHT,
-                                ),
-                                Sense::click(),
-                            );
-                            ui.painter().rect_filled(
-                                button_rect,
-                                layout::LOG_MENU_BUTTON_RADIUS,
-                                if button_response.hovered() {
-                                    ORANGE
-                                } else {
-                                    button_bg
-                                },
-                            );
-                            ui.painter().text(
-                                button_rect.center(),
-                                Align2::CENTER_CENTER,
-                                label,
-                                FontId::proportional(layout::LOG_MENU_BUTTON_FONT_SIZE),
-                                TEXT_MAIN,
-                            );
-                            if button_response.clicked() {
-                                choice = Some(view);
-                            }
-                            // Keep the loop's identity stable if the menu is
-                            // later expanded with more log views.
-                            let _ = index;
+                            true,
+                        ) {
+                            choice = Some(view);
                         }
-                    });
+                    }
+                });
                 // Match the history dropdown's 1px translucent outline.
                 paint_surface_outline(
                     ui.painter(),
@@ -6000,10 +6871,13 @@ fn show_history_key_tooltip(
     let statistics_content_width = (required_width - 2.0 * padding_x - icon_column_width).max(1.0);
     let statistics_view_width = (inner_width - icon_column_width).max(1.0);
     let overflow = statistics_content_width > statistics_view_width + 0.5;
+    // Reserve the fully expanded bar plus the same gutter used on the right.
+    // Otherwise hovering the floating horizontal bar covers the last row.
+    let scrollbar_space = layout::SCROLLBAR_GUTTER + layout::SCROLLBAR_HOVER_WIDTH.ceil() as i8 + 2;
     let statistics_height = row_height * 3.0
         + gap * 2.0
         + if overflow {
-            f32::from(layout::SCROLLBAR_GUTTER) + 2.0
+            f32::from(scrollbar_space)
         } else {
             0.0
         };
@@ -6105,11 +6979,7 @@ fn show_history_key_tooltip(
                                 left: 0,
                                 right: 0,
                                 top: 0,
-                                bottom: if overflow {
-                                    layout::SCROLLBAR_GUTTER + 2
-                                } else {
-                                    0
-                                },
+                                bottom: if overflow { scrollbar_space } else { 0 },
                             })
                             .show(ui, |ui| {
                                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -6311,8 +7181,7 @@ fn show_client_card_tooltip(
     let state_text = states.join(" • ");
     let width = tooltip_width_for_texts(&response.ctx, &[target.title(), &state_text], 12.0);
     show_hover_tooltip_contents_width(response, egui::RectAlign::TOP, width, |ui| {
-        // Match the previous plain multiline tooltip: no extra vertical
-        // line gap and no layout gap around the bullet separator.
+        // Keep Windows' existing multiline layout and bullet spacing.
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
         ui.label(
             RichText::new(target.title())
@@ -6361,6 +7230,9 @@ fn open_external_link(ctx: &egui::Context, url: &str) {
 fn show_colored_status_tooltip(response: &egui::Response, text: &'static str, color: Color32) {
     let width = tooltip_width_for_texts(&response.ctx, &[text], 12.0);
     show_hover_tooltip_contents_width(response, egui::RectAlign::TOP, width, |ui| {
+        #[cfg(target_os = "macos")]
+        mac_tooltip_text(ui, text, color);
+        #[cfg(not(target_os = "macos"))]
         ui.add(egui::Label::new(
             RichText::new(text).size(12.0).color(color),
         ));
@@ -6375,11 +7247,75 @@ fn show_hover_tooltip_at(
     let text = text.into();
     let width = tooltip_width_for_texts(&response.ctx, &[&text], 12.0);
     show_hover_tooltip_contents_width(response, align, width, |ui| {
+        #[cfg(target_os = "macos")]
+        {
+            if text.contains('\n') {
+                // Use the same fixed line boxes as Windows for the protocol
+                // conversion hint. Centering each line in the available
+                // width/height avoids the font-metric drift of the custom
+                // macOS glyph painter.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for line in text.split('\n') {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(line).size(12.0).color(Color32::WHITE),
+                                )
+                                .halign(egui::Align::Center),
+                            );
+                        },
+                    );
+                }
+            } else {
+                mac_tooltip_text(ui, &text, Color32::WHITE);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         ui.add(
             egui::Label::new(RichText::new(text).size(12.0).color(Color32::WHITE))
                 .halign(egui::Align::Center),
         );
     });
+}
+
+#[cfg(target_os = "macos")]
+fn mac_tooltip_text(ui: &mut egui::Ui, text: &str, color: Color32) {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat::simple(FontId::proportional(12.0), color),
+    );
+    mac_tooltip_line(ui, job, color);
+}
+
+#[cfg(target_os = "macos")]
+fn mac_tooltip_line(ui: &mut egui::Ui, mut job: egui::text::LayoutJob, fallback: Color32) {
+    job.wrap.max_width = ui.available_width();
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    // Center single-line hints within the tooltip's full minimum-height row,
+    // including any space left over by the font's natural line height.
+    let height = galley.size().y.max(layout::TOOLTIP_CONTENT_MIN_HEIGHT);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
+    // Center the rendered glyphs, including Chinese fallback font metrics,
+    // rather than leaving the unused part of a minimum-height row below them.
+    let center_y = if galley.mesh_bounds.is_positive() {
+        galley.mesh_bounds.center().y
+    } else {
+        galley.size().y / 2.0
+    };
+    ui.painter().galley(
+        egui::pos2(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - center_y + layout::MAC_TOOLTIP_TEXT_OFFSET_Y,
+        ),
+        galley,
+        fallback,
+    );
 }
 
 fn tooltip_width_for_texts(ctx: &egui::Context, texts: &[&str], font_size: f32) -> f32 {
@@ -6425,7 +7361,8 @@ fn show_hover_tooltip_contents_with_frame(
     usage_style: bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
-    let mut tooltip = egui::Tooltip::for_enabled(response);
+    let (tooltip_response, width) = tooltip_response_with_side_margin(response, width);
+    let mut tooltip = egui::Tooltip::for_enabled(&tooltip_response);
     if let Some(width) = width {
         tooltip = tooltip.width(width);
     }
@@ -6494,6 +7431,25 @@ fn show_hover_tooltip_contents_with_frame(
 
 fn tooltip_background_color() -> Color32 {
     Color32::from_rgba_unmultiplied(54, 0, 148, layout::TOOLTIP_BACKGROUND_ALPHA)
+}
+
+fn tooltip_response_with_side_margin(
+    response: &egui::Response,
+    width: Option<f32>,
+) -> (egui::Response, Option<f32>) {
+    let Some(width) = width else {
+        return (response.clone(), None);
+    };
+    let margin = layout::TOOLTIP_WINDOW_SIDE_MARGIN;
+    let screen = response.ctx.input(|input| input.content_rect());
+    let width = width.min((screen.width() - 2.0 * margin).max(1.0));
+    let min_center = screen.left() + margin + width / 2.0;
+    let max_center = screen.right() - margin - width / 2.0;
+    let center = response.interact_rect.center().x;
+    let shift = center.clamp(min_center, max_center) - center;
+    let mut anchored = response.clone();
+    anchored.interact_rect = response.interact_rect.translate(egui::vec2(shift, 0.0));
+    (anchored, Some(width))
 }
 
 fn selected_client_status(
@@ -6635,55 +7591,96 @@ fn is_account_mode_status(status: &str) -> bool {
 }
 
 fn failed_task_status(task: &RunningTask) -> String {
-    if task.log_text.contains("需手动重启")
-        || task.log_text.contains("Manual restart required")
-        || task.log_text.contains("自动重启 • 失败!")
-        || task.log_text.contains("Auto-restart • failed!")
-    {
-        format!(
-            "{} • {}",
-            task.label,
-            i18n::tr("自动重启 • 失败!", "Auto-restart • failed!")
-        )
-    } else if task
+    if matches!(task.kind, TaskKind::Client(_) | TaskKind::AccountMode(_)) {
+        let fallback = if matches!(task.kind, TaskKind::AccountMode(_)) {
+            ClientOperation::Account
+        } else {
+            ClientOperation::Start
+        };
+        return task
+            .operation
+            .unwrap_or(fallback)
+            .failure(&task.label, i18n::language());
+    }
+    if task
         .log_text
         .contains(crate::gateway::MAINLAND_ACCESS_ERROR)
     {
-        i18n::tr(
+        return i18n::tr(
             crate::gateway::MAINLAND_ACCESS_ERROR,
             crate::gateway::MAINLAND_ACCESS_ERROR_EN,
         )
-        .to_owned()
-    } else {
-        format!(
-            "{} • {}",
-            task.label,
-            i18n::tr(
-                "失败 • 请查看运行日志 ...",
-                "Failed • Check the runtime log ..."
-            )
-        )
+        .to_owned();
     }
+    format!(
+        "{} • {}",
+        task.label,
+        i18n::tr(
+            "失败 • 请查看运行日志 ...",
+            "Failed • Check the runtime log ..."
+        )
+    )
 }
 
-fn refresh_task_log(task: &mut RunningTask) {
+fn installation_failure_status(target: ClientTarget, log_text: &str) -> String {
+    #[cfg(not(target_os = "macos"))]
+    let _ = log_text;
+    #[cfg(target_os = "macos")]
+    if matches!(
+        target,
+        ClientTarget::CodexDesktop | ClientTarget::ClaudeDesktop
+    ) && log_text.contains("自动安装仅支持 Windows 平台")
+    {
+        return format!("{} • 自动安装仅支持 Windows 平台", target.title());
+    }
+    #[cfg(target_os = "macos")]
+    if matches!(
+        target,
+        ClientTarget::CodexDesktop | ClientTarget::ClaudeDesktop
+    ) && log_text.contains("Automatic installation is supported on Windows only")
+    {
+        return format!(
+            "{} • Automatic installation is supported on Windows only",
+            target.title()
+        );
+    }
+    format!(
+        "{} • {}",
+        target.title(),
+        i18n::tr(
+            "安装失败 • 请查看运行日志",
+            "Installation failed • Check the runtime log"
+        )
+    )
+}
+
+fn refresh_task_log(task: &mut RunningTask, force: bool) -> bool {
     let Ok(metadata) = fs::metadata(&task.log_path) else {
-        return;
+        return false;
     };
     let Ok(modified) = metadata.modified() else {
-        return;
+        return false;
     };
-    if modified <= task.last_log_read {
-        return;
+    // Windows can defer the last-write timestamp while a writer handle stays
+    // open. Always read once more after a job finishes before archiving its log.
+    if !force && modified <= task.last_log_read {
+        return false;
     }
     let Ok(mut file) = File::open(&task.log_path) else {
-        return;
+        return false;
     };
     let mut text = String::new();
     if file.read_to_string(&mut text).is_ok() {
-        task.log_text = text.trim_start_matches('\u{feff}').to_owned();
+        let bom_bytes = text.len() - text.trim_start_matches('\u{feff}').len();
+        text.drain(..bom_bytes);
+        let changed = task.log_text != text;
+        if changed {
+            task.log_text = text;
+        }
         task.last_log_read = modified;
+        return changed;
     }
+    false
 }
 
 fn task_log_title(kind: TaskKind, label: &str) -> String {
@@ -6771,6 +7768,7 @@ fn is_structured_log_title(line: &str) -> bool {
 fn normalize_log_body(text: &str) -> String {
     let mut output = Vec::new();
     let mut previous_was_blank = false;
+    let mut in_error = false;
     for raw_line in text.lines() {
         let line = raw_line.trim_end();
         if line.trim().is_empty() {
@@ -6778,19 +7776,29 @@ fn normalize_log_body(text: &str) -> String {
                 output.push(String::new());
             }
             previous_was_blank = true;
+            in_error = false;
             continue;
         }
-
         previous_was_blank = false;
         if let Some(detail) = line
+            .trim_start()
             .strip_prefix("错误:")
-            .or_else(|| line.strip_prefix("错误："))
-            .or_else(|| line.strip_prefix("Error:"))
-            .map(str::trim)
-            .filter(|detail| !detail.is_empty())
+            .or_else(|| line.trim_start().strip_prefix("错误："))
+            .or_else(|| line.trim_start().strip_prefix("Error:"))
         {
-            output.push(i18n::tr("错误：", "Error:").to_owned());
-            output.push(format!("  {detail}"));
+            output.push(i18n::tr("错误:", "Error:").to_owned());
+            in_error = true;
+            if !detail.trim().is_empty() {
+                let detail = i18n::runtime_log_error_text(detail);
+                if !detail.is_empty() {
+                    output.push(format!("    {detail}"));
+                }
+            }
+        } else if in_error {
+            let detail = i18n::runtime_log_error_text(line);
+            if !detail.is_empty() {
+                output.push(format!("    {detail}"));
+            }
         } else {
             output.push(line.to_owned());
         }
@@ -6801,20 +7809,27 @@ fn normalize_log_body(text: &str) -> String {
     output.join("\n")
 }
 
-fn join_ordered_log_sections(sections: impl IntoIterator<Item = (u64, String)>) -> String {
+fn join_ordered_log_sections<T: AsRef<str>>(
+    sections: impl IntoIterator<Item = (u64, T)>,
+) -> String {
     let mut sections = sections
         .into_iter()
-        .filter_map(|(sequence, text)| {
-            let text = text.trim_end();
-            (!text.is_empty()).then(|| (sequence, text.to_owned()))
-        })
+        .filter(|(_, text)| !text.as_ref().trim_end().is_empty())
         .collect::<Vec<_>>();
     sections.sort_by_key(|(sequence, _)| *sequence);
-    sections
-        .into_iter()
-        .map(|(_, text)| text)
-        .collect::<Vec<_>>()
-        .join(LOG_SECTION_SEPARATOR)
+    let size = sections
+        .iter()
+        .map(|(_, text)| text.as_ref().trim_end().len())
+        .sum::<usize>()
+        + sections.len().saturating_sub(1) * LOG_SECTION_SEPARATOR.len();
+    let mut joined = String::with_capacity(size);
+    for (index, (_, text)) in sections.into_iter().enumerate() {
+        if index > 0 {
+            joined.push_str(LOG_SECTION_SEPARATOR);
+        }
+        joined.push_str(text.as_ref().trim_end());
+    }
+    joined
 }
 
 fn latest_install_progress(text: &str) -> Option<String> {
@@ -6854,13 +7869,13 @@ fn validate_gateway_inputs(gateway_url: &str, api_key: &str) -> Result<()> {
         Ok(parsed) => parsed,
         Err(_) => bail!(
             "{}",
-            i18n::tr("接口地址格式无效!", "Invalid gateway URL format!")
+            i18n::tr("接口地址格式无效 !", "Invalid gateway URL format !")
         ),
     };
     if parsed.host_str().is_none() {
         bail!(
             "{}",
-            i18n::tr("接口地址缺少主机名!", "Gateway URL is missing a host!")
+            i18n::tr("接口地址缺少主机名 !", "Gateway URL is missing a host !")
         );
     }
     if parsed.scheme() != "https"
@@ -6868,13 +7883,13 @@ fn validate_gateway_inputs(gateway_url: &str, api_key: &str) -> Result<()> {
     {
         bail!(
             "{}",
-            i18n::tr("接口地址必须使用 HTTPS!", "Gateway URLs must use HTTPS!")
+            i18n::tr("接口地址必须使用 HTTPS !", "Gateway URLs must use HTTPS !")
         );
     }
     if api_key.trim().is_empty() {
         bail!(
             "{}",
-            i18n::tr("请输入 API Key!", "Please enter the API key!")
+            i18n::tr("请输入 API KEY !", "Please enter the API KEY !")
         );
     }
     Ok(())
@@ -6950,6 +7965,16 @@ fn load_embedded_svg_texture(
     context.load_texture(name, color_image, TextureOptions::LINEAR)
 }
 
+fn load_embedded_png_texture(context: &egui::Context, name: &str, bytes: &[u8]) -> TextureHandle {
+    let image = resvg::tiny_skia::Pixmap::decode_png(bytes)
+        .unwrap_or_else(|error| panic!("内置 PNG 图片 {name} 解码失败：{error}"));
+    let color_image = egui::ColorImage::from_rgba_premultiplied(
+        [image.width() as usize, image.height() as usize],
+        image.data(),
+    );
+    context.load_texture(name, color_image, TextureOptions::LINEAR)
+}
+
 fn align_rect_to_physical_pixels(context: &egui::Context, rect: Rect) -> Rect {
     let pixels_per_point = context.pixels_per_point().max(0.5);
     let snap = |value: f32| (value * pixels_per_point).round() / pixels_per_point;
@@ -6983,21 +8008,39 @@ fn unpremultiply_rgba(premultiplied: &[u8]) -> Vec<u8> {
 }
 
 fn native_icon_data() -> Result<egui::IconData> {
-    const ICON_SIZE: u32 = 64;
-    let premultiplied = render_svg_rgba(
-        include_bytes!("../assets/gui/svg/logo.svg"),
-        ICON_SIZE,
-        ICON_SIZE,
-    )
-    .context("无法读取内置程序图标")?;
-    Ok(egui::IconData {
-        rgba: unpremultiply_rgba(&premultiplied),
-        width: ICON_SIZE,
-        height: ICON_SIZE,
-    })
+    #[cfg(target_os = "macos")]
+    {
+        let source = include_bytes!("../assets/gui/macos-logo/macos-1024.png");
+        let decoder = png::Decoder::new(Cursor::new(source));
+        let mut reader = decoder.read_info().context("无法读取内置 macOS 程序图标")?;
+        let mut rgba = vec![0; reader.output_buffer_size()];
+        let info = reader
+            .next_frame(&mut rgba)
+            .context("无法解码内置 macOS 程序图标")?;
+        if info.color_type != png::ColorType::Rgba {
+            bail!("内置 macOS 程序图标必须是 RGBA PNG");
+        }
+        return Ok(egui::IconData {
+            rgba: rgba[..info.buffer_size()].to_vec(),
+            width: info.width,
+            height: info.height,
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        const ICON_SIZE: u32 = 64;
+        let source = include_bytes!("../assets/gui/svg/logo.svg").as_slice();
+        let premultiplied =
+            render_svg_rgba(source, ICON_SIZE, ICON_SIZE).context("无法读取内置程序图标")?;
+        Ok(egui::IconData {
+            rgba: unpremultiply_rgba(&premultiplied),
+            width: ICON_SIZE,
+            height: ICON_SIZE,
+        })
+    }
 }
 fn maybe_write_layout_probe(ui: &egui::Ui, rects: &[(&str, Rect)]) {
-    let Some(path) = std::env::var_os("ZNNZ_GUI_LAYOUT_DEBUG") else {
+    let Some(path) = std::env::var_os("LITTLE_MUNGBEAN_GUI_LAYOUT_DEBUG") else {
         return;
     };
     static WRITE_ONCE: std::sync::Once = std::sync::Once::new();
@@ -7139,7 +8182,7 @@ unsafe extern "system" fn native_create_hook_proc(
         let create_window = unsafe { &mut *(lparam.0 as *mut CBT_CREATEWNDW) };
         if !create_window.lpcs.is_null() {
             let create = unsafe { &mut *create_window.lpcs };
-            if unsafe { wide_window_title_equals(create.lpszName, WINDOW_TITLE) } {
+            if unsafe { wide_window_title_equals(create.lpszName, window_title()) } {
                 // 直接修改即将传给 CreateWindowExW 的 CREATESTRUCTW。窗口从诞生起就是
                 // Popup 客户区，不再先创建系统标题栏后移除，行为与 InstallPE.c 一致。
                 create.style = clean_native_window_style(create.style as u32) as i32;
@@ -7648,6 +8691,9 @@ unsafe fn apply_cutout_region(hwnd: HWND, width: i32, height: i32, dpi: u32) {
 }
 
 fn configure_style(context: &egui::Context) {
+    // The app is dark-only. Pin the active theme before customizing its style so
+    // system appearance changes cannot switch any scroll area to light defaults.
+    context.set_theme(egui::Theme::Dark);
     context.global_style_mut(|style| {
         style.spacing.item_spacing = Vec2::new(8.0, 8.0);
         style.animation_time = layout::MENU_ANIMATION_SECONDS;
@@ -7692,54 +8738,110 @@ fn configure_style(context: &egui::Context) {
         style.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
     });
 }
+#[cfg(target_os = "macos")]
+const MACOS_CJK_FONT_BYTES: &[u8] = include_bytes!("../assets/gui/macos-font.ttf");
+
+#[cfg(target_os = "macos")]
+fn macos_fallback_font(
+    path: &str,
+    storage: &'static std::sync::OnceLock<Option<Box<[u8]>>>,
+) -> Option<FontData> {
+    storage
+        .get_or_init(|| fs::read(path).ok().map(Vec::into_boxed_slice))
+        .as_deref()
+        .map(FontData::from_static)
+}
+
 fn install_fonts(context: &egui::Context) {
-    let regular_candidates = [
-        PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
-        PathBuf::from(r"C:\Windows\Fonts\msyh.ttf"),
-        PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
-    ];
-    let Some(regular_bytes) = regular_candidates
-        .iter()
-        .find_map(|path| fs::read(path).ok())
-    else {
-        return;
-    };
-    let bold_bytes = [
-        PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttc"),
-        PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttf"),
-        PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
-    ]
-    .iter()
-    .find_map(|path| fs::read(path).ok())
-    .unwrap_or_else(|| regular_bytes.clone());
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        "system-cjk".to_owned(),
-        FontData::from_owned(regular_bytes).into(),
-    );
-    fonts.font_data.insert(
-        "system-cjk-bold".to_owned(),
-        FontData::from_owned(bold_bytes).into(),
-    );
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+    #[cfg(target_os = "macos")]
+    {
+        // Prefer the bundled font for Chinese and Latin, with SF fallbacks,
+        // without converting system PingFang outlines or cloning font bytes.
+        let mut fonts = FontDefinitions::default();
+        let mut proportional = vec!["macos-cjk".to_owned()];
+        let mut monospace = vec!["macos-cjk".to_owned()];
+        static SF: std::sync::OnceLock<Option<Box<[u8]>>> = std::sync::OnceLock::new();
+        static SF_MONO: std::sync::OnceLock<Option<Box<[u8]>>> = std::sync::OnceLock::new();
+        if let Some(sf) = macos_fallback_font("/System/Library/Fonts/SFNS.ttf", &SF) {
+            fonts.font_data.insert("system-sf".into(), sf.into());
+            proportional.push("system-sf".to_owned());
+        }
+        if let Some(sf) = macos_fallback_font("/System/Library/Fonts/SFNSMono.ttf", &SF_MONO) {
+            fonts.font_data.insert("system-sf-mono".into(), sf.into());
+            monospace.push("system-sf-mono".to_owned());
+        }
+        fonts.font_data.insert(
+            "macos-cjk".into(),
+            FontData::from_static(MACOS_CJK_FONT_BYTES)
+                // Keep the bundled font's baseline without extra shifting.
+                .tweak(egui::FontTweak {
+                    y_offset_factor: -0.0,
+                    ..Default::default()
+                })
+                .into(),
+        );
+        let mut status = proportional.clone();
+        for (family, chain) in [
+            (FontFamily::Proportional, proportional),
+            (FontFamily::Monospace, monospace),
+        ] {
+            let existing = fonts.families.entry(family).or_default();
+            existing.splice(0..0, chain);
+        }
+        status.extend(fonts.families[&FontFamily::Proportional].iter().cloned());
         fonts
             .families
-            .entry(family)
-            .or_default()
-            .insert(0, "system-cjk".to_owned());
+            .insert(FontFamily::Name("status-bold".into()), status);
+        context.set_fonts(fonts);
+        return;
     }
-    fonts.families.insert(
-        FontFamily::Name("status-bold".into()),
-        vec!["system-cjk-bold".to_owned(), "system-cjk".to_owned()],
-    );
-    context.set_fonts(fonts);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let regular_candidates = [
+            PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
+            PathBuf::from(r"C:\Windows\Fonts\msyh.ttf"),
+            PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
+        ];
+        let Some(regular_bytes) = regular_candidates
+            .iter()
+            .find_map(|path| fs::read(path).ok())
+        else {
+            return;
+        };
+        let bold_bytes = [
+            PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttc"),
+            PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttf"),
+            PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
+        ]
+        .iter()
+        .find_map(|path| fs::read(path).ok())
+        .unwrap_or_else(|| regular_bytes.clone());
+        let mut fonts = FontDefinitions::default();
+        fonts.font_data.insert(
+            "system-cjk".to_owned(),
+            FontData::from_owned(regular_bytes).into(),
+        );
+        fonts.font_data.insert(
+            "system-cjk-bold".to_owned(),
+            FontData::from_owned(bold_bytes).into(),
+        );
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .insert(0, "system-cjk".to_owned());
+        }
+        fonts.families.insert(
+            FontFamily::Name("status-bold".into()),
+            vec!["system-cjk-bold".to_owned(), "system-cjk".to_owned()],
+        );
+        context.set_fonts(fonts);
+    }
 }
 
 fn logs_directory() -> Result<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .context("无法确定 LOCALAPPDATA")?;
-    let directory = local.join("Agent-Switch").join("logs");
+    let directory = crate::platform_paths::data_root()?.join("logs");
     fs::create_dir_all(&directory).context("无法创建日志目录")?;
     Ok(directory)
 }
@@ -7783,7 +8885,7 @@ fn write_session_log_sections(
     let content = join_ordered_log_sections(
         sections
             .iter()
-            .map(|section| (section.sequence, section.text.clone())),
+            .map(|section| (section.sequence, section.text.as_str())),
     );
     let mut file = OpenOptions::new()
         .create(true)
@@ -7800,7 +8902,452 @@ fn write_session_log_sections(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn header_links_follow_the_interface_language() {
+        for url in [
+            super::LOGO_URL,
+            super::UPDATE_URL,
+            super::GITHUB_URL,
+            super::STAR_URL,
+            super::HELP_URL,
+        ] {
+            assert_eq!(
+                super::localized_header_url(url, crate::i18n::Language::ZhCn),
+                url
+            );
+            assert_eq!(
+                super::localized_header_url(url, crate::i18n::Language::En),
+                url.strip_suffix("-ZH").unwrap().to_owned() + "-EN"
+            );
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn content_background_fades_source_alpha_and_stays_inside_content() {
+        use std::collections::HashMap;
+
+        for alpha in [255, 128] {
+            let ctx = egui::Context::default();
+            let texture = ctx.load_texture(
+                "background-alpha-test",
+                egui::ColorImage::filled([2, 2], Color32::from_white_alpha(alpha)),
+                TextureOptions::LINEAR,
+            );
+            let screen = Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(layout::WINDOW_WIDTH, layout::WINDOW_HEIGHT),
+            );
+            let content =
+                Rect::from_min_max(egui::pos2(15.0, 70.0), screen.max - egui::vec2(15.0, 50.0));
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    paint_window_background(ui, screen);
+                    paint_content_background(ui, content, screen, &texture);
+                },
+            );
+            let textures: HashMap<_, _> = output
+                .textures_delta
+                .set
+                .iter()
+                .map(|(id, delta)| {
+                    let egui::ImageData::Color(image) = &delta.image;
+                    (*id, image.as_ref().clone())
+                })
+                .collect();
+            let image = test_render::rasterize(&ctx, output, &textures);
+            let pixel = |x: f32, y: f32| image.pixel((x * 2.0) as u32, (y * 2.0) as u32).unwrap();
+            for progress in [0.0, 0.45, 0.9, 0.95] {
+                let value = pixel(
+                    content.center().x,
+                    content.top() + content.height() * progress,
+                );
+                let opacity = (f32::from(alpha) / 255.0) * (1.0 - progress / 0.9).max(0.0);
+                let expected = 48.0 + (255.0 - 48.0) * opacity;
+                assert!(
+                    (f32::from(value.red()) - expected).abs() < 3.0,
+                    "source alpha {alpha}, gradient {progress}: {value:?}, expected {expected}"
+                );
+            }
+            for point in [
+                content.left_top() - egui::vec2(1.0, 1.0),
+                content.right_bottom() + egui::vec2(1.0, 1.0),
+            ] {
+                let value = pixel(point.x, point.y);
+                assert_eq!([value.red(), value.green(), value.blue()], [48, 48, 48]);
+                assert!(value.alpha() >= 254, "software preview alpha rounding");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_fallback_font_clones_borrow_the_same_storage() {
+        static STORAGE: std::sync::OnceLock<Option<Box<[u8]>>> = std::sync::OnceLock::new();
+        let first = macos_fallback_font("/System/Library/Fonts/SFNS.ttf", &STORAGE)
+            .expect("SF fallback font");
+        let second = macos_fallback_font("/System/Library/Fonts/SFNS.ttf", &STORAGE)
+            .expect("cached SF fallback font");
+        assert!(matches!(first.font, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(first.font.as_ptr(), second.font.as_ptr());
+        assert_eq!(first.font.as_ptr(), first.clone().font.as_ptr());
+    }
+
+    #[test]
+    fn runtime_log_refresh_reports_changes_without_replacing_unchanged_text() {
+        let path = std::env::temp_dir().join(format!(
+            "little-mungbean-log-refresh-{}-{}.log",
+            std::process::id(),
+            current_log_timestamp()
+        ));
+        let mut task = RunningTask {
+            operation: None,
+            configuration_fingerprint: None,
+            sequence: 1,
+            kind: TaskKind::Client(ClientTarget::CodexDesktop),
+            child: None,
+            job: None,
+            worker_pid: 0,
+            log_path: path.clone(),
+            label: "Codex Desktop".into(),
+            log_title: "Codex Desktop • 启动 • 连接".into(),
+            log_text: String::new(),
+            last_log_read: UNIX_EPOCH,
+        };
+        fs::write(&path, "\u{feff}连接成功\nfirst output").unwrap();
+        assert!(refresh_task_log(&mut task, false));
+        assert_eq!(task.log_text, "连接成功\nfirst output");
+        let original = task.log_text.as_ptr();
+        assert!(!refresh_task_log(&mut task, false));
+        // A metadata refresh with identical content also preserves the buffer.
+        task.last_log_read = UNIX_EPOCH;
+        assert!(!refresh_task_log(&mut task, true));
+        assert_eq!(task.log_text.as_ptr(), original);
+        fs::write(&path, "\u{feff}连接成功\nfirst output\nnew output").unwrap();
+        // Emulate a cached timestamp that has not advanced after the worker's
+        // final append. Completion must still collect the new output.
+        task.last_log_read = SystemTime::now() + Duration::from_secs(1);
+        assert!(!refresh_task_log(&mut task, false));
+        assert!(refresh_task_log(&mut task, true));
+        assert!(task.log_text.ends_with("new output"));
+        assert!(format_log_section(&task.log_title, &task.log_text).contains("new output"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_single_line_tooltip_centers_visible_glyphs_in_frame() {
+        for scale in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            install_fonts(&ctx);
+            for text in ["切换账号模式", "Switch account mode", "连接 • Fetch models"] {
+                let mut frame_rect = Rect::NOTHING;
+                let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    frame_rect = egui::Frame::new()
+                        .inner_margin(egui::Margin::same(5))
+                        .show(ui, |ui| {
+                            ui.set_width(280.0);
+                            mac_tooltip_text(ui, text, Color32::WHITE);
+                        })
+                        .response
+                        .rect;
+                });
+                let shape = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(shape) if shape.galley.job.text == text => Some(shape),
+                        _ => None,
+                    })
+                    .expect("tooltip text shape");
+                let visible_center = shape.pos.y + shape.galley.mesh_bounds.center().y;
+                assert!(
+                    (visible_center - frame_rect.center().y).abs() < 0.1,
+                    "{text}: glyph center {visible_center}, frame center {}",
+                    frame_rect.center().y
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_font_chain_contains_chinese_glyphs() {
+        let data = FontData::from_static(MACOS_CJK_FONT_BYTES);
+        assert!(matches!(data.font, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(data.font.as_ptr(), MACOS_CJK_FONT_BYTES.as_ptr());
+        assert_eq!(data.clone().font.as_ptr(), MACOS_CJK_FONT_BYTES.as_ptr());
+        for pixels_per_point in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(pixels_per_point);
+            install_fonts(&ctx);
+            let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+            for family in [
+                FontFamily::Proportional,
+                FontFamily::Monospace,
+                FontFamily::Name("status-bold".into()),
+            ] {
+                for size in [11.0, 12.0, 14.0, 20.0] {
+                    ctx.fonts_mut(|fonts| {
+                        let font = FontId::new(size, family.clone());
+                        let text = "中文连接运行中未连接默认网关模型列表账号错误";
+                        assert!(fonts.has_glyphs(&font, text));
+                        let galley = fonts.layout_no_wrap(text.into(), font, Color32::WHITE);
+                        let glyphs = galley.rows.iter().flat_map(|row| row.glyphs.iter()).collect::<Vec<_>>();
+                        assert_eq!(glyphs.len(), text.chars().count());
+                        assert!(glyphs.iter().all(|glyph| !glyph.uv_rect.is_nothing()));
+                        assert_ne!(glyphs[0].uv_rect.min, glyphs[1].uv_rect.min,
+                            "different Chinese characters must not render the same replacement glyph");
+                    });
+                }
+            }
+            let status_output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                paint_status_text(
+                    ui,
+                    Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(320.0, 30.0)),
+                    "Codex Desktop • 运行中 • 未连接",
+                    Color32::WHITE,
+                );
+            });
+            let status_galleys = status_output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        (text.galley.job.text == "Codex Desktop • 运行中 • 未连接")
+                            .then_some(&text.galley)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                status_galleys.len(),
+                1,
+                "colored status must share a single galley"
+            );
+            assert_eq!(status_galleys[0].rows.len(), 1);
+            ctx.fonts_mut(|fonts| {
+                let galley = fonts.layout_no_wrap(
+                    "Codex Desktop运行中未连接".into(),
+                    FontId::proportional(11.0),
+                    Color32::WHITE,
+                );
+                let glyphs = &galley.rows[0].glyphs;
+                let visible = glyphs
+                    .iter()
+                    .filter(|glyph| !glyph.uv_rect.is_nothing())
+                    .collect::<Vec<_>>();
+                let center = |glyph: &&egui::epaint::text::Glyph| {
+                    glyph.pos.y + glyph.uv_rect.offset.y + glyph.uv_rect.size.y / 2.0
+                };
+                let latin = visible
+                    .iter()
+                    .filter(|glyph| glyph.chr.is_ascii_alphabetic())
+                    .collect::<Vec<_>>();
+                let chinese = visible
+                    .iter()
+                    .filter(|glyph| !glyph.chr.is_ascii())
+                    .collect::<Vec<_>>();
+                let latin_y =
+                    latin.iter().map(|glyph| center(glyph)).sum::<f32>() / latin.len() as f32;
+                let chinese_y =
+                    chinese.iter().map(|glyph| center(glyph)).sum::<f32>() / chinese.len() as f32;
+                assert!(
+                    (latin_y - chinese_y).abs() <= 1.5,
+                    "mixed text optical centers: Latin={latin_y}, Chinese={chinese_y}"
+                );
+            });
+            if pixels_per_point == 2.0 {
+                if let Some(path) = std::env::var_os("LITTLE_MUNGBEAN_FONT_PREVIEW") {
+                    write_macos_font_preview(&ctx, &path);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_macos_font_preview(ctx: &egui::Context, path: &std::ffi::OsStr) {
+        let (galleys, atlas) = ctx.fonts_mut(|fonts| {
+            let lines = [
+                ("Little Mungbean • SF + 自备中文字体", 20.0),
+                ("Codex Desktop • 运行中 • 未连接", 11.0),
+                ("默认模型列表    网关模型列表    切换账号模式", 12.0),
+                ("Codex Desktop\n运行中 • 未连接", 12.0),
+                (
+                    "中文日志：连接成功，错误信息可复制。English log: ready.",
+                    12.0,
+                ),
+            ];
+            let galleys = lines
+                .into_iter()
+                .map(|(text, size)| {
+                    fonts.layout_no_wrap(text.into(), FontId::proportional(size), Color32::WHITE)
+                })
+                .collect::<Vec<_>>();
+            (galleys, fonts.image())
+        });
+        let (width, height) = (1000usize, 340usize);
+        let mut pixels = vec![48u8; width * height * 3];
+        let mut origin_y = 18.0;
+        for galley in galleys {
+            for row in &galley.rows {
+                for glyph in &row.glyphs {
+                    let uv = glyph.uv_rect;
+                    let x = ((18.0 + row.pos.x + glyph.pos.x + uv.offset.x) * 2.0).round() as isize;
+                    let y =
+                        ((origin_y + row.pos.y + glyph.pos.y + uv.offset.y) * 2.0).round() as isize;
+                    for dy in 0..usize::from(uv.max[1] - uv.min[1]) {
+                        for dx in 0..usize::from(uv.max[0] - uv.min[0]) {
+                            let (px, py) = (x + dx as isize, y + dy as isize);
+                            if px < 0 || py < 0 || px >= width as isize || py >= height as isize {
+                                continue;
+                            }
+                            let src = atlas.pixels[(usize::from(uv.min[1]) + dy) * atlas.size[0]
+                                + usize::from(uv.min[0])
+                                + dx];
+                            let value = 48 + ((u16::from(src.a()) * 192) / 255) as u8;
+                            let start = (py as usize * width + px as usize) * 3;
+                            pixels[start..start + 3].fill(value);
+                        }
+                    }
+                }
+            }
+            origin_y += galley.size().y + 10.0;
+        }
+        let file = File::create(path).expect("font preview output");
+        let mut encoder = png::Encoder::new(file, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&pixels)
+            .unwrap();
+    }
+
+    #[test]
+    fn logs_support_keyboard_and_context_menu_copy_without_editing() {
+        for view in [LogView::Runtime, LogView::Model] {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            configure_style(&ctx);
+            let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 500.0));
+            let log = "连接成功\nCodex Desktop: gateway ready\n中文日志可复制";
+            let mut time = 0.0;
+            let mut frame = |events| {
+                time += 0.25;
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        assert!(render_log_window(ui.ctx(), screen, view, log, log));
+                    },
+                )
+            };
+            for _ in 0..3 {
+                frame(Vec::new());
+            }
+            let text_position = |output: &egui::FullOutput, needle: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                            Some(text.pos + egui::vec2(5.0, 8.0))
+                        }
+                        _ => None,
+                    })
+                    .expect("log/menu text must be rendered")
+            };
+            let button = |pos, button, pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let output = frame(Vec::new());
+            let pointer = text_position(&output, "连接成功");
+            frame(vec![egui::Event::PointerMoved(pointer)]);
+            frame(vec![button(pointer, egui::PointerButton::Primary, true)]);
+            frame(vec![button(pointer, egui::PointerButton::Primary, false)]);
+            let modifiers = egui::Modifiers {
+                mac_cmd: true,
+                command: true,
+                ..Default::default()
+            };
+            frame(vec![egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]);
+            let copies = |output: &egui::FullOutput| {
+                output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .filter_map(|command| match command {
+                        egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(copies(&frame(vec![egui::Event::Copy])), vec![log]);
+            // Read-only logs must not lose text when a user types or pastes.
+            let output = frame(vec![
+                egui::Event::Text("replacement".into()),
+                egui::Event::Paste("pasted".into()),
+            ]);
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == log
+            )));
+            // Restore a partial Unicode selection for the context-menu Copy action.
+            let id = ctx.memory(|memory| memory.focused()).unwrap();
+            let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(4),
+                )));
+            state.store(&ctx, id);
+            frame(Vec::new());
+            text_menu::test_select_next(&ctx, text_menu::Action::Copy);
+            frame(vec![egui::Event::PointerMoved(pointer)]);
+            frame(vec![button(pointer, egui::PointerButton::Secondary, true)]);
+            assert_eq!(
+                copies(&frame(vec![button(
+                    pointer,
+                    egui::PointerButton::Secondary,
+                    false
+                )])),
+                vec!["连接成功"]
+            );
+            assert_eq!(
+                text_menu::test_entries(&ctx),
+                vec![
+                    (text_menu::Action::Copy, true),
+                    (text_menu::Action::SelectAll, true),
+                ]
+            );
+            text_menu::test_select_next(&ctx, text_menu::Action::SelectAll);
+            frame(vec![button(pointer, egui::PointerButton::Secondary, true)]);
+            frame(vec![button(pointer, egui::PointerButton::Secondary, false)]);
+            assert_eq!(copies(&frame(vec![egui::Event::Copy])), vec![log]);
+        }
+    }
 
     #[test]
     fn provider_grid_fits_seven_icons_inside_the_real_scroll_content_width() {
@@ -7828,6 +9375,7 @@ mod tests {
                                 ui,
                                 "Provider records",
                                 layout::PROVIDER_RECORDS_TITLE_LINE_LENGTH,
+                                layout::PROVIDER_RECORDS_TITLE_TOP_GAP,
                                 layout::PROVIDER_RECORDS_TITLE_BOTTOM_GAP,
                             );
                             ui.allocate_exact_size(Vec2::new(content_width, 500.0), Sense::hover());
@@ -7952,6 +9500,133 @@ mod tests {
     }
 
     #[test]
+    fn client_selection_slide_matches_web_timing_and_keeps_position_when_interrupted() {
+        // At the CSS curve's parameter t=.5, x=.275 and y=.8.
+        assert!((client_selection_easing(0.275) - 0.8).abs() < 0.0001);
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("client-slide-test");
+        let step = |time, target| {
+            let mut value = 0.0;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| value = animate_client_selection(ui.ctx(), id, target),
+            );
+            value
+        };
+        assert_eq!(step(0.0, 10.0), 10.0);
+        assert_eq!(step(1.0, 110.0), 10.0);
+        assert!((step(1.066, 110.0) - 90.0).abs() < 0.01);
+        assert!((step(1.066, 50.0) - 90.0).abs() < 0.01);
+        assert_eq!(step(1.31, 50.0), 50.0);
+        assert_eq!(step(2.0, 210.0), 50.0);
+        assert_eq!(step(2.25, 210.0), 210.0);
+    }
+
+    #[test]
+    fn client_card_right_click_menu_preserves_selection_and_disables_unavailable_actions() {
+        for attached in [false, true] {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            configure_style(&ctx);
+            let assets = GuiAssets::load(&ctx);
+            let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 300.0));
+            let card = Rect::from_min_size(egui::pos2(40.0, 35.0), egui::vec2(70.0, 70.0));
+            let mut time = 0.0;
+            let mut frame = |events| {
+                time += 0.25;
+                let mut action = None;
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let response = render_client_card_at(
+                            ui,
+                            card,
+                            ClientTarget::ClaudeCode,
+                            false,
+                            attached,
+                            true,
+                            attached,
+                            None,
+                            &assets,
+                        );
+                        assert!(
+                            !response.clicked(),
+                            "right click must preserve the selected client"
+                        );
+                        if let Some(menu) = egui::Popup::context_menu(&response)
+                            .frame(log_menu_frame())
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| action = client_card_context_menu_items(ui, true, attached))
+                        {
+                            paint_surface_outline(
+                                &response.ctx.layer_painter(menu.response.layer_id),
+                                menu.response.rect,
+                                layout::LOG_MENU_CORNER_RADIUS,
+                            );
+                        }
+                    },
+                );
+                (action, output)
+            };
+            for _ in 0..3 {
+                frame(Vec::new());
+            }
+            let pointer = card.center();
+            let button = |pos, button, pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(vec![egui::Event::PointerMoved(pointer)]);
+            frame(vec![button(pointer, egui::PointerButton::Secondary, true)]);
+            frame(vec![button(pointer, egui::PointerButton::Secondary, false)]);
+            for _ in 0..3 {
+                frame(Vec::new());
+            }
+            let (_, output) = frame(Vec::new());
+            let item = |needle: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == needle => {
+                            Some(Rect::from_min_size(text.pos, text.galley.size()).center())
+                        }
+                        _ => None,
+                    })
+                    .expect("context menu item is visible")
+            };
+            let open = item(i18n::tr("打开配置目录", "Open configuration directory"));
+            let copy = item(i18n::tr("复制连接令牌", "Copy connection token"));
+            assert!(open.y < copy.y, "directory action must be listed first");
+            frame(vec![egui::Event::PointerMoved(copy)]);
+            frame(vec![button(copy, egui::PointerButton::Primary, true)]);
+            let (action, _) = frame(vec![button(copy, egui::PointerButton::Primary, false)]);
+            if attached {
+                assert!(matches!(action, Some(ConnectionAction::CopyToken)));
+            } else {
+                assert!(
+                    action.is_none(),
+                    "disconnected clients cannot copy a stale token"
+                );
+                frame(vec![egui::Event::PointerMoved(open)]);
+                frame(vec![button(open, egui::PointerButton::Primary, true)]);
+                let (action, _) = frame(vec![button(open, egui::PointerButton::Primary, false)]);
+                assert!(matches!(action, Some(ConnectionAction::OpenDirectory)));
+            }
+        }
+    }
+
+    #[test]
     fn log_window_keeps_centered_title_fixed_bounds_and_working_close_button() {
         for size in [egui::vec2(380.0, 430.0), egui::vec2(320.0, 300.0)] {
             let ctx = egui::Context::default();
@@ -8035,19 +9710,20 @@ mod tests {
                 .iter()
                 .find_map(|shape| match &shape.shape {
                     egui::Shape::Rect(rect)
-                        if rect.fill == Color32::from_rgb(60, 60, 60)
-                            && rect.rect.size() == Vec2::splat(layout::LOG_CLOSE_BUTTON_SIZE) =>
+                        if rect.fill == Color32::TRANSPARENT
+                            && rect.rect.size() == Vec2::splat(layout::PANEL_BACK_SIZE) =>
                     {
                         Some(rect.rect)
                     }
                     _ => None,
                 })
-                .expect("close button uses the gray default surface");
-            assert_eq!(close.size(), egui::vec2(24.0, 24.0));
+                .expect("back button uses a transparent default surface");
+            assert_eq!(close.size(), egui::vec2(22.0, 22.0));
+            assert!(close.center().x < header.center().x);
             frame(vec![egui::Event::PointerMoved(close.center())]);
             let (_, hovered) = frame(vec![egui::Event::PointerMoved(close.center())]);
             assert!(hovered.shapes.iter().any(|shape| matches!(&shape.shape,
-                egui::Shape::Rect(rect) if rect.rect == close && rect.fill == Color32::from_rgb(201, 0, 0)
+                egui::Shape::Rect(rect) if rect.rect == close && rect.fill == ORANGE
             )));
             frame(vec![egui::Event::PointerButton {
                 pos: close.center(),
@@ -8264,6 +9940,19 @@ mod tests {
                         _ => None,
                     })
                     .expect("overflowing statistics have a horizontal scrollbar");
+                let data_bottom = scrolled
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.pos.y + text.galley.size().y),
+                        _ => None,
+                    })
+                    .fold(f32::NEG_INFINITY, f32::max);
+                assert!(
+                    handle.bottom() - layout::SCROLLBAR_HOVER_WIDTH
+                        >= data_bottom + f32::from(layout::SCROLLBAR_GUTTER),
+                    "even the expanded scrollbar must leave a gutter below the data"
+                );
                 let start = handle.center();
                 let end = egui::pos2(popup.left() + 1.0, start.y);
                 frame(vec![egui::Event::PointerMoved(start)]);
@@ -8521,8 +10210,15 @@ mod tests {
     #[test]
     fn log_formatter_indents_inline_error_details() {
         assert_eq!(
+            format_log_section(
+                "Claude Desktop • 启动 • 连接",
+                "错误:\n  Claude Desktop • 自动重启 • 失败!：底层错误\n\t第二个原因"
+            ),
+            "===== Claude Desktop • 启动 • 连接 =====\n\n错误:\n    底层错误\n    第二个原因\n\n========================================="
+        );
+        assert_eq!(
             format_log_section("Claude Desktop • 安装", "错误: 下载超时"),
-            "===== Claude Desktop • 安装 =====\n\n错误：\n  下载超时\n\n========================================="
+            "===== Claude Desktop • 安装 =====\n\n错误:\n    下载超时\n\n========================================="
         );
     }
 
@@ -8608,6 +10304,7 @@ mod tests {
     #[test]
     fn inherited_runtime_task_keeps_client_running_indicator_on() {
         let tasks = vec![RunningTask {
+            operation: None,
             configuration_fingerprint: None,
             sequence: 1,
             kind: TaskKind::Client(ClientTarget::CodexDesktop),
@@ -8690,6 +10387,7 @@ mod tests {
     #[test]
     fn gateway_success_status_uses_dot_separators() {
         let task = RunningTask {
+            operation: None,
             configuration_fingerprint: None,
             sequence: 1,
             kind: TaskKind::GatewayTest,
@@ -8771,8 +10469,114 @@ mod tests {
     }
 
     #[test]
+    fn model_list_selection_distinguishes_active_pending_and_disconnected() {
+        for target in ClientTarget::ALL {
+            for active in [ModelListMode::BuiltIn, ModelListMode::Gateway] {
+                for selected in [ModelListMode::BuiltIn, ModelListMode::Gateway] {
+                    let status = ModelListSelectionStatus {
+                        target,
+                        active: Some(active),
+                        selected,
+                    };
+                    assert_eq!(status.shows_check(), active == selected);
+                    assert_eq!(status.restart_pending(), active != selected);
+                    for language in [i18n::Language::ZhCn, i18n::Language::En] {
+                        let expected = format!(
+                            "{} • {}{}",
+                            target.title(),
+                            model_mode_label_for_language(selected, language),
+                            if active != selected {
+                                format!(" • {}", language.text("重启生效", "Restart to apply"))
+                            } else {
+                                String::new()
+                            }
+                        );
+                        assert_eq!(status.text(language), expected);
+                    }
+                    let disconnected = ModelListSelectionStatus {
+                        active: None,
+                        ..status
+                    };
+                    assert!(!disconnected.shows_check());
+                    assert!(!disconnected.restart_pending());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_list_selection_renders_check_only_on_active_choice() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let assets = GuiAssets::load(&ctx);
+        let active = ModelListSelectionStatus {
+            target: ClientTarget::CodexDesktop,
+            active: Some(ModelListMode::Gateway),
+            selected: ModelListMode::Gateway,
+        };
+        for status in [
+            active,
+            ModelListSelectionStatus {
+                selected: ModelListMode::BuiltIn,
+                ..active
+            },
+            ModelListSelectionStatus {
+                active: None,
+                ..active
+            },
+        ] {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                paint_model_list_selection_status(
+                    ui,
+                    Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(450.0, 34.0)),
+                    status,
+                    Color32::WHITE,
+                    &assets.select_green,
+                );
+            });
+            let checks = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == assets.select_green.id() => {
+                        Some(mesh.calc_bounds())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(checks.len(), usize::from(status.shows_check()));
+            #[cfg(target_os = "macos")]
+            {
+                let texts = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(texts, vec![status.text(i18n::Language::ZhCn)]);
+            }
+            if let Some(check) = checks.first() {
+                assert_eq!(check.size(), Vec2::splat(12.0));
+            }
+            if status.restart_pending() {
+                assert!(output.shapes.iter().any(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => text.galley.job.sections.iter().any(|section| {
+                        &text.galley.job.text[section.byte_range.start.0..section.byte_range.end.0]
+                            == "重启生效"
+                            && section.format.color == NOT_INSTALLED
+                    }),
+                    _ => false,
+                }));
+            }
+        }
+    }
+
+    #[test]
     fn blocked_custom_gateway_uses_concise_status_message() {
         let task = RunningTask {
+            operation: None,
             configuration_fingerprint: None,
             sequence: 1,
             kind: TaskKind::GatewayTest,
@@ -8792,6 +10596,59 @@ mod tests {
             failed_task_status(&task),
             crate::gateway::MAINLAND_ACCESS_ERROR
         );
+    }
+
+    #[test]
+    fn client_failure_stage_does_not_depend_on_error_wording() {
+        for target in ClientTarget::ALL {
+            for (operation, expected) in [
+                (
+                    ClientOperation::Start,
+                    "启动 & 连接 • 失败 • 请查看运行日志...",
+                ),
+                (
+                    ClientOperation::Restart,
+                    "自动重启 • 失败 • 请查看运行日志...",
+                ),
+                (
+                    ClientOperation::Account,
+                    "自动重启 • 失败 • 请查看运行日志...",
+                ),
+            ] {
+                let task = RunningTask {
+                    operation: Some(operation),
+                    configuration_fingerprint: None,
+                    sequence: 1,
+                    kind: TaskKind::Client(target),
+                    child: None,
+                    job: None,
+                    worker_pid: 0,
+                    log_path: PathBuf::new(),
+                    label: target.title().into(),
+                    log_title: String::new(),
+                    log_text:
+                        "Auto-restart • failed!: old context must not change the requested stage"
+                            .into(),
+                    last_log_read: UNIX_EPOCH,
+                };
+                assert_eq!(
+                    failed_task_status(&task),
+                    format!("{} • {expected}", target.title())
+                );
+                assert_eq!(
+                    operation.failure(target.title(), i18n::Language::En),
+                    format!(
+                        "{} • {}",
+                        target.title(),
+                        if operation == ClientOperation::Start {
+                            "Start & Connect • Failed • Check the runtime log..."
+                        } else {
+                            "Auto-restart • Failed • Check the runtime log..."
+                        }
+                    )
+                );
+            }
+        }
     }
 
     #[test]
@@ -8865,6 +10722,7 @@ mod tests {
                     gateway_url: format!("https://{}.test/v1", target.id()),
                     api_key: target.id().into(),
                     preset_provider: Some("预设名称".into()),
+                    conversion_enabled: false,
                 },
             );
         }
@@ -8897,6 +10755,7 @@ mod tests {
                 gateway_url: "https://active.test/v1".into(),
                 api_key: "active-key".into(),
                 preset_provider: None,
+                conversion_enabled: false,
             },
         );
         assert_eq!(
@@ -8923,7 +10782,7 @@ mod tests {
     #[test]
     fn empty_gateway_input_hides_the_url_parser_detail() {
         let error = validate_gateway_inputs("", "sk-test").unwrap_err();
-        assert_eq!(format!("{error:#}"), "接口地址格式无效!");
+        assert_eq!(format!("{error:#}"), "接口地址格式无效 !");
         assert!(!format!("{error:#}").contains("relative URL"));
     }
 

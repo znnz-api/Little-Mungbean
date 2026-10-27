@@ -1,7 +1,7 @@
 #[cfg(not(test))]
 use std::sync::OnceLock;
 
-pub const LANGUAGE_ENV: &str = "ZNNZ_LAUNCHER_LANG";
+pub const LANGUAGE_ENV: &str = "LITTLE_MUNGBEAN_LAUNCHER_LANG";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
@@ -76,11 +76,85 @@ pub fn runtime_error(error: &anyhow::Error) -> String {
     runtime_error_text(&format!("{error:#}"))
 }
 
+/// Operation names belong to the log header, not to the error body. Remove
+/// only known launcher context frames; URLs and arbitrary technical details
+/// containing colons must remain intact.
+pub fn runtime_log_error(error: &anyhow::Error) -> String {
+    let mut details = Vec::new();
+    for cause in error.chain() {
+        let detail = strip_operation_context(&cause.to_string());
+        if !detail.is_empty() && !details.contains(&detail) {
+            details.push(detail);
+        }
+    }
+    runtime_log_error_text(&details.join("\n"))
+}
+
+pub fn runtime_log_error_text(detail: &str) -> String {
+    runtime_error_text_with_separator(&strip_operation_context(detail), language(), "\n")
+}
+
+fn strip_operation_context(detail: &str) -> String {
+    detail
+        .lines()
+        .filter_map(|line| {
+            let mut text = line.trim();
+            while let Some(rest) = crate::gui_worker::ClientTarget::ALL
+                .into_iter()
+                .find_map(|target| text.strip_prefix(target.title()))
+                .and_then(|rest| rest.trim_start().strip_prefix('•'))
+            {
+                let rest = rest.trim_start();
+                let Some(body) = [
+                    "启动 & 连接 • 失败!",
+                    "启动 • 连接 • 失败!",
+                    "自动重启 • 失败!",
+                    "自动启动 • 失败!",
+                    "Start & Connect • Failed!",
+                    "Start • Connect • Failed!",
+                    "Auto-restart • failed!",
+                    "Auto-restart • Failed!",
+                    "Auto-start • failed!",
+                    "Auto-start • Failed!",
+                ]
+                .into_iter()
+                .find_map(|prefix| rest.strip_prefix(prefix)) else {
+                    break;
+                };
+                let body = body.trim_start();
+                if body.is_empty() {
+                    text = "";
+                    break;
+                }
+                let Some(body) = body.strip_prefix([':', '：']) else {
+                    break;
+                };
+                text = body.trim_start();
+            }
+            (!text.is_empty()).then(|| text.to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn runtime_error_block(detail: &str) -> String {
+    let lines = detail
+        .lines()
+        .map(|line| format!("    {}", line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n{}:\n{lines}", tr("错误", "Error"))
+}
+
 pub fn runtime_error_text(detail: &str) -> String {
     runtime_error_text_for_language(detail, language())
 }
 
 fn runtime_error_text_for_language(detail: &str, language: Language) -> String {
+    runtime_error_text_with_separator(detail, language, " ")
+}
+
+fn runtime_error_text_with_separator(detail: &str, language: Language, separator: &str) -> String {
     if language == Language::ZhCn {
         return detail.to_owned();
     }
@@ -96,7 +170,7 @@ fn runtime_error_text_for_language(detail: &str, language: Language) -> String {
         })
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(separator);
     if detail.is_empty() {
         "The operation failed.".to_owned()
     } else {
@@ -124,6 +198,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn log_errors_drop_operation_context_and_indent_every_cause() {
+        for target in crate::gui_worker::ClientTarget::ALL {
+            let error = anyhow::anyhow!("当前平台不支持 Claude Desktop Windows 注册表配置")
+                .context(format!("{} • 自动重启 • 失败!", target.title()));
+            let detail = runtime_log_error(&error);
+            assert_eq!(detail, "当前平台不支持 Claude Desktop Windows 注册表配置");
+            assert_eq!(
+                runtime_error_block(&detail),
+                "\n错误:\n    当前平台不支持 Claude Desktop Windows 注册表配置"
+            );
+            let error = anyhow::anyhow!("connection refused: http://127.0.0.1:53601/responses")
+                .context(format!("{} • Auto-restart • failed!", target.title()))
+                .context("Failed to connect to the local listener");
+            assert_eq!(
+                runtime_log_error(&error),
+                "Failed to connect to the local listener\nconnection refused: http://127.0.0.1:53601/responses"
+            );
+        }
+        assert_eq!(
+            runtime_log_error_text("Claude Desktop • 自动重启 • 失败!: underlying: detail"),
+            "underlying: detail"
+        );
+        assert_eq!(
+            runtime_log_error_text("Claude Desktop unavailable: http://127.0.0.1:1234"),
+            "Claude Desktop unavailable: http://127.0.0.1:1234"
+        );
+        assert_eq!(
+            runtime_error_block("first\n    second\r\nthird"),
+            "\n错误:\n    first\n    second\n    third"
+        );
+    }
+
+    #[test]
     fn language_tags_follow_chinese_or_english_policy() {
         assert_eq!(Language::from_tag("zh-CN"), Some(Language::ZhCn));
         assert_eq!(Language::from_tag("zh_TW"), Some(Language::ZhCn));
@@ -135,6 +242,20 @@ mod tests {
     fn localized_text_selects_expected_branch() {
         assert_eq!(Language::ZhCn.text("中文", "English"), "中文");
         assert_eq!(Language::En.text("中文", "English"), "English");
+    }
+
+    #[test]
+    fn english_log_errors_preserve_lines_without_chinese_context() {
+        let detail = "未翻译的上下文\nFailed to fetch the model catalog.\nThe local network cannot reach the gateway endpoint: https://example.com:8443 (https://example.com:8443/v1/models)\nCheck the gateway URL, API key, local network status, and firewall.";
+        let expected = detail.split_once('\n').unwrap().1;
+        assert_eq!(
+            runtime_error_text_with_separator(detail, Language::En, "\n"),
+            expected
+        );
+        assert_eq!(
+            runtime_error_text_for_language(detail, Language::En),
+            expected.replace('\n', " ")
+        );
     }
 
     #[test]

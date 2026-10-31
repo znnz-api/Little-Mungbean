@@ -1,36 +1,31 @@
 # Little-Mungbean
 
-> English | [Chinese](README_ZH.md)
+> [Official website](https://mungbean.cc/en/) • [Documentation](https://mungbean.cc/en/doc.html) • English • [中文](README_ZH.md)
 
-Little Mungbean • A free, open-source, simple, lightweight AI gateway manager that lets Codex and Claude clients share a switchable, observable local gateway with multi-provider management, local protocol conversion, model injection, MCP Server and Skills management, and usage statistics.
+Little Mungbean • A free, open-source, simple, lightweight AI gateway manager that lets Codex and Claude clients share a switchable, observable local gateway with multi-provider management, local protocol conversion, model injection, MCP Server and Skills management, and usage statistics...
 
-![Little-Mungbean](imgs/Little-Mungbean-en/png/12345678-1290.webp)
-
-Screenshots below show the Windows interface before the product rename. macOS release and build instructions: [macOS v1.1](docs/macos-release-zh.md), [building](docs/build.md).
-
-On macOS, desktop client installation currently opens the official download page; drag the downloaded app into Applications. The installation buttons support automatic desktop installation on Windows.
+![Little-Mungbean](imgs/Little-Mungbean-en/png/12345678.png)
 
 ## Features
 
-- 🚀 **One-click client installation** • Install Codex CLI, Codex Desktop, Claude Code, and Claude Desktop from Little-Mungbean.
-- 🔀 **Multi-provider management** • Save multiple provider endpoints and API Keys, rename entries, reorder them by dragging, and switch quickly.
-- 🔄 **Provider switching** • After changing a provider endpoint or API Key, click **Restart • Connect** to restart the selected Agent client and reload its configuration.
-- 🔐 **Account mode switching** • Switch between local gateway mode and the client’s official account mode without signing out, while restoring the original configuration automatically.
-- 🔌 **Independent client connections** • Manage installation, runtime, connection state, and gateway routing for all four Agent clients separately. On macOS, desktop clients launch through the system application service with their own resource attribution in Activity Monitor. Managed CLI terminal identities survive Little-Mungbean restarts so model lists can be switched again; terminals left by older builds need to be closed once before the first connection with the new build.
-- 🧰 **MCP Server management and registry** • Add local MCP servers or install them from the registry; edit, search, enable or disable, and remove servers; manage support for multiple Agent clients; and visit MCP server websites.
-- 📚 **Skills management and registry** • Add local Skills or install them from the registry; import directories or ZIP archives; edit, search, enable or disable, and remove Skills; and manage support for multiple Agent clients. Visit Skill websites. To import a ZIP into Claude Desktop, use Customize > Skills. ZIP files are saved to the `Little-Mungbean-Skills` folder in Downloads by default.
-- ✂️ **Native text menus** • Right-click the main inputs and the MCP Server / Skills search and editor fields for Undo, Redo, Cut, Copy, Paste, and Select All. Uses native macOS and Windows menus; About and log windows support drag selection, Select All, and Copy.
-- 🧩 **Local protocol conversion** • Convert between OpenAI, Anthropic, Gemini, and other protocols locally. Same-family models are preferred for direct pass-through, and conversion can be toggled live. See the FAQ below.
-- 📥 **Gateway model management** • Fetch model lists from providers and hide legacy or unused models for each provider.
-- 🗂️ **Model mapping injection** • Inject provider models into the Agent client model picker so they can be selected directly.
-- 🎛️ **Per-client model lists** • Choose **Default models** or **Gateway models** independently for each client. Apply the selected list on the next **Start • Connect** or **Restart • Connect**. On macOS and Windows, Codex CLI appends `(From endpoint)` to the descriptions of default models that exactly match the fetched gateway catalog.
-- 📊 **Provider usage statistics** • Track request counts and Token usage separately for each provider.
-- 💡 **Real-time status detection** • Detect whether each Agent client is installed, running, and connected to the gateway.
-- 🛡️ **Protected configuration** • API Keys are encrypted locally, and the gateway listens only on the local loopback address.
-- 🖱️ **Client shortcuts and connection details** • Right-click a client card to open its configuration directory or copy the **Base URL** and **Token** for its current local connection to use with other tools.
-- 📝 **Runtime logs** • Record client startup, connection, restart, model injection, gateway operations, and MCP/Skills changes. Successful startup and restart logs include the local listening address; CLI logs also show configuration and working directories. Copy connection tokens from the client card menu.
-- 📋 **Request logs** • Record the Agent, provider, model, status code, Tokens, duration, time to first token, endpoint, and protocol conversion details.
-- 🌍 **Chinese and English UI** • Support localized interface text and log output.
+- 🚀 **One-click client installation** • Install Codex CLI, Codex Desktop, Claude Code, and Claude Desktop with one click.
+- 💡 **Real-time status detection** • Automatically detect whether Agent clients are installed, running, and connected to the gateway.
+- 🛡️ **Secure configuration storage** • API keys are encrypted locally, and the gateway listens only on the local loopback address.
+- 🔀 **Multiple providers** • Save multiple provider endpoints and API keys, rename providers, drag to reorder them, and switch between them quickly.
+- 🔄 **Provider switching** • After changing a provider endpoint or API key, click **Restart • Connect** to restart the selected Agent client and reload its configuration.
+- 🔐 **Account mode switching** • Switch between local gateway mode and the Agent client's official account mode without signing out. Original settings are restored automatically.
+- 🔌 **Independent client connections** • Manage installation, running and connection status, and gateway routes separately for all four Agent clients.
+- 📊 **Provider usage statistics** • Track request counts and token usage separately for each provider.
+- 📥 **Gateway model management** • Fetch model lists from providers and hide outdated or rarely used models for each provider.
+- 🗂️ **Model injection** • Choose **Default model list** or **Gateway model list** independently for each Agent client, adding provider models to the client's model list for easy selection.
+- 🧩 **Local protocol conversion** • Convert between OpenAI, Anthropic, Gemini, and other supported protocols. Models from the same family are forwarded directly where possible, and conversion can be toggled without restarting. See the FAQ below.
+- 🧰 **MCP Server management and market** • Manually add MCP Servers or install them from the market; edit, search, enable, disable, or remove them; use them across multiple Agent clients; and visit their service websites.
+- 📚 **Skills management and market** • Manually add Skills or install them from the market; import directories or ZIP archives; edit, search, enable, disable, or remove Skills; use them across multiple Agent clients; and visit their service websites.
+- ✂️ **Native text context menus** • Input fields, search boxes, and editors in the main window, MCP Server, and Skills views support undo, redo, cut, copy, paste, and select all using native macOS and Windows menus. About and log views support drag selection, select all, and copy.
+- 🖱️ **Client shortcuts and connection details** • Right-click a client card to open its configuration directory or copy the current local connection's **Base URL** and **Token** for use with other tools.
+- 📝 **Runtime log** • Record each operation and any error messages.
+- 📋 **Request log** • Record Agent clients, providers, models, status codes, tokens, elapsed time, time to first token, request endpoints, and protocol conversion details.
+- 🌍 **Chinese and English** • Both the interface and log output support Chinese and English.
 
 ## Agent client status lights
 
@@ -47,7 +42,7 @@ On macOS, desktop client installation currently opens the official download page
 ## Usage
 
 1. Open Little-Mungbean and enter an endpoint and API Key, or choose a provider preset.
-2. Fetch the models and choose which models should be mapped into the Agent client.
+2. Fetch models and select the model to inject into the Agent client.
 3. Select a client and click **Start • Connect**.
 
 After changing the endpoint or API Key, click **Restart • Connect**. Little-Mungbean automatically restarts the related client. Protocol conversion can be toggled independently without restarting the client.
@@ -56,13 +51,11 @@ Closing the Little-Mungbean window keeps the local gateway running in the system
 
 ## Network proxies
 
-Model forwarding, model discovery, registries, and downloads follow the current proxy policy. `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` (including lowercase names) take precedence per destination protocol; unspecified protocols use system settings. HTTP, HTTPS, SOCKS4/4a, and SOCKS5/5h are supported. Use `socks5h://` for proxy-side destination DNS.
+Little-Mungbean automatically uses your system proxy for model requests, model lists, markets, and downloads. Usually, enabling **System Proxy** in your proxy app is all you need.
 
-Windows reads the active connection's fixed proxies, exceptions, PAC, and automatic detection settings. macOS uses CFNetwork for HTTP/HTTPS/SOCKS, exceptions, and automatic proxies; its new PAC path still needs real-Mac validation. `NO_PROXY` supports domains, wildcards, ports, and IP networks, and loopback connections always bypass proxies. System changes apply to subsequent requests. Set environment variables before starting Little-Mungbean.
-
-PAC preserves ordered backup proxies and explicit `DIRECT` entries. Only connection-stage failures permit failover; model requests are not replayed after response or streaming failures, and proxy authentication failures do not switch routes. Explicit PAC download or execution errors are reported. When Windows automatic detection finds no PAC, fixed proxies or direct access remain available. TUN/VPN routing is managed by the OS and the proxy software.
-
-External installers such as npm receive a snapshot of proxy settings through environment variables, which cannot fully express per-URL PAC rules. Model requests forwarded by the local gateway still resolve their routes independently.
+- **Supported proxies** • HTTP, HTTPS, SOCKS4/4a, SOCKS5/5h, and PAC (automatic proxy scripts). Use `socks5h://` to let the proxy resolve destination domain names.
+- **Custom settings** • Set `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` before starting Little-Mungbean; lowercase names also work. These override the system proxy for the relevant protocol. Use `NO_PROXY` to bypass the proxy for specified addresses. Local gateway connections always bypass proxies.
+- **TUN / VPN** • Routing is handled by your operating system and proxy app; no separate setup in Little-Mungbean is needed.
 
 ## Frequently asked questions
 

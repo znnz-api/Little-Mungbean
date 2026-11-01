@@ -75,9 +75,9 @@ const LOG_SECTION_FOOTER: &str = "=========================================";
 const LOG_SECTION_SEPARATOR: &str = "\n\n";
 pub fn window_title() -> &'static str {
     if i18n::language() == i18n::Language::ZhCn {
-        "小绿豆 • Little Mungbean • v1.1"
+        "小绿豆 • Little Mungbean • v1.2"
     } else {
-        "Little Mungbean • v1.1"
+        "Little Mungbean • v1.2"
     }
 }
 const LOGO_URL: &str = "https://r.networkpe.top/Little-Mungbean-Logo-ZH";

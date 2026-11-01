@@ -123,13 +123,7 @@ pub async fn inject_target_catalog(
     port: u16,
     injection: &crate::injection::ScriptBundle,
 ) -> Result<()> {
-    inject_target_with_health(
-        target,
-        port,
-        injection,
-        injection.catalog_health_expression(),
-    )
-    .await
+    inject_target_with_health(target, port, injection, injection.health_expression()).await
 }
 
 async fn inject_target_with_health(
@@ -168,7 +162,7 @@ async fn inject_target_with_health(
     )
     .await?;
     let mut healthy = false;
-    for attempt in 0..25u64 {
+    for attempt in 0..60u64 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -210,7 +204,7 @@ async fn inject_target_with_health(
         .and_then(|response| response.pointer("/result/result/value").cloned())
         .unwrap_or_else(|| json!({ "installed": false, "diagnostic": "无法读取健康详情" }));
         bail!(
-            "注入脚本已执行，但目录或 Codex 请求客户端状态在 5 秒内未通过健康检查。健康状态: {}",
+            "模型目录已加载，但 Codex 实际模型列表在 12 秒内未通过校验。健康状态: {}",
             serde_json::to_string(&details).unwrap_or_else(|_| "<无法序列化>".to_owned())
         )
     }
@@ -258,14 +252,6 @@ pub async fn target_health(
     injection: &crate::injection::ScriptBundle,
 ) -> Result<bool> {
     target_health_with_expression(target, port, injection.health_expression()).await
-}
-
-pub async fn target_catalog_health(
-    target: &CdpTarget,
-    port: u16,
-    injection: &crate::injection::ScriptBundle,
-) -> Result<bool> {
-    target_health_with_expression(target, port, injection.catalog_health_expression()).await
 }
 
 async fn target_health_with_expression(

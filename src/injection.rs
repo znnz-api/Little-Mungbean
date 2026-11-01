@@ -3,15 +3,12 @@ use serde_json::{Value, json};
 
 const MODEL_SCRIPT: &str = include_str!("../assets/renderer-inject.js");
 
-const CATALOG_HEALTH: &str =
-    "Boolean(globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__?.health?.().catalogReady)";
-const MODEL_HEALTH: &str = "Boolean(globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__?.health?.().catalogReady && globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__?.health?.().requestClientReady)";
-const MODEL_DETAILS: &str = "globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__?.health?.() ?? { installed: false, catalogReady: false, modelCount: 0, patchedClientCount: 0, requestClientReady: false, catalogSource: 'none', failures: [{ where: 'bootstrap', message: 'model injection object is missing' }] }";
+const MODEL_HEALTH: &str = "Boolean(globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__?.health?.().catalogReady && globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__?.health?.().modelListVerified)";
+const MODEL_DETAILS: &str = "globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__?.health?.() ?? { installed: false, catalogReady: false, modelListVerified: false, modelCount: 0, failures: [{ where: 'bootstrap', message: 'model verification object is missing' }] }";
 
 #[derive(Clone, Debug)]
 pub struct ScriptBundle {
     source: String,
-    catalog_health_expression: &'static str,
     health_expression: &'static str,
     health_details_expression: &'static str,
 }
@@ -23,10 +20,6 @@ impl ScriptBundle {
 
     pub fn health_expression(&self) -> &'static str {
         self.health_expression
-    }
-
-    pub fn catalog_health_expression(&self) -> &'static str {
-        self.catalog_health_expression
     }
 
     pub fn health_details_expression(&self) -> &'static str {
@@ -56,7 +49,6 @@ pub fn build(
     );
     Ok(ScriptBundle {
         source,
-        catalog_health_expression: CATALOG_HEALTH,
         health_expression: MODEL_HEALTH,
         health_details_expression: MODEL_DETAILS,
     })
@@ -90,15 +82,9 @@ mod tests {
         assert!(script.source().contains("\"catalog\""));
         assert!(script.source().contains("catalogSource = \"inline\""));
         assert!(!script.source().contains("72216192"));
-        assert_eq!(script.catalog_health_expression(), CATALOG_HEALTH);
         assert_eq!(script.health_expression(), MODEL_HEALTH);
-        assert!(script.catalog_health_expression().contains("catalogReady"));
-        assert!(
-            !script
-                .catalog_health_expression()
-                .contains("requestClientReady")
-        );
-        assert!(script.health_expression().contains("requestClientReady"));
+        assert!(script.health_expression().contains("catalogReady"));
+        assert!(script.health_expression().contains("modelListVerified"));
     }
 
     #[test]
@@ -120,6 +106,9 @@ mod tests {
             "patchReact",
             "patchGraph",
             "patchNameArray",
+            "webpackChunk",
+            "getDynamicConfig",
+            "patchModelListResult",
         ] {
             assert!(
                 !MODEL_SCRIPT.contains(forbidden),
@@ -127,15 +116,14 @@ mod tests {
             );
         }
         for required in [
-            "list-models-for-host",
             "model/list",
-            "patchModelListResult",
+            "verifyModelList",
+            "codex-host-chunked-message-v1",
             "patchModelPickerLabels",
             "schedulePickerLabelRefresh",
             "pointerdown",
             "data-codex-intelligence-trigger",
             "aria-controls",
-            "107580212",
         ] {
             assert!(
                 MODEL_SCRIPT.contains(required),

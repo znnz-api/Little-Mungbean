@@ -686,7 +686,6 @@ async fn watchdog(
     injected: &mut HashSet<String>,
 ) -> Result<()> {
     let mut missed = 0usize;
-    let mut request_client_ready = HashSet::new();
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
@@ -771,28 +770,14 @@ async fn watchdog(
         };
 
         for target in targets {
-            let catalog_ready = if injected.contains(&target.id) {
-                cdp::target_catalog_health(&target, debug_port, renderer_injection)
+            let model_list_ready = if injected.contains(&target.id) {
+                cdp::target_health(&target, debug_port, renderer_injection)
                     .await
                     .unwrap_or(false)
             } else {
                 false
             };
-            if catalog_ready {
-                if !request_client_ready.contains(&target.id)
-                    && cdp::target_health(&target, debug_port, renderer_injection)
-                        .await
-                        .unwrap_or(false)
-                {
-                    request_client_ready.insert(target.id.clone());
-                    info!(
-                        "{}",
-                        i18n::tr(
-                            "Codex Desktop 模型请求客户端已挂载",
-                            "Codex Desktop model request client is attached"
-                        )
-                    );
-                }
+            if model_list_ready {
                 continue;
             }
             match cdp::inject_target_catalog(&target, debug_port, renderer_injection).await {

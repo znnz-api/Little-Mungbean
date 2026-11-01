@@ -66,10 +66,10 @@ pub const INPUT_SURFACE_BG_BLUE: u8 = 30;
 pub const INPUT_SURFACE_BG_ALPHA: u8 = 255;
 
 // 区块 2 客户端总面板、模型列表选框和状态栏日志按钮背景、“安装客户端”与“启动/重启 • 连接”禁用背景色，对应 CSS：rgb(255 255 255 / 5%)。
-pub const SECONDARY_SURFACE_BG_RED: u8 = 59;
-pub const SECONDARY_SURFACE_BG_GREEN: u8 = 59;
-pub const SECONDARY_SURFACE_BG_BLUE: u8 = 59;
-pub const SECONDARY_SURFACE_BG_ALPHA: u8 = 255;
+pub const SECONDARY_SURFACE_BG_RED: u8 = 61;
+pub const SECONDARY_SURFACE_BG_GREEN: u8 = 61;
+pub const SECONDARY_SURFACE_BG_BLUE: u8 = 61;
+pub const SECONDARY_SURFACE_BG_ALPHA: u8 = 216;
 // ---------------------------------------------------------------------------
 // 顶部标题栏
 // ---------------------------------------------------------------------------

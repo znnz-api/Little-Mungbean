@@ -1,6 +1,6 @@
 [package]
 name = "little-mungbean"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Little-Mungbean local AI gateway manager for Codex and Claude clients"
 license = "Apache-2.0"

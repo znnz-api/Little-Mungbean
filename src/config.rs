@@ -892,7 +892,7 @@ pub fn install_codex_with_catalog(
         api_key,
         gateway,
         &provider,
-        false,
+        use_gateway_model_list,
         use_gateway_model_list,
     )?;
     if use_gateway_model_list {
@@ -1298,7 +1298,7 @@ pub async fn install(paths: &ClientPaths, options: &InstallOptions, api_key: &st
     }
     let config = parse_toml_or_empty(&read_optional(&paths.codex_config)?, &paths.codex_config)?;
     let provider = choose_provider_id(&config, &paths.codex_sessions);
-    let mut files = merged_codex_files(paths, options, api_key, &gateway, &provider, false, true)?;
+    let mut files = merged_codex_files(paths, options, api_key, &gateway, &provider, true, true)?;
     let slots = select_model_slots(&gateway, &SlotOverrides::default())?;
     let settings = merge_claude_settings(
         read_json_object(&paths.claude_settings, "Claude settings.json")?,
@@ -2291,6 +2291,20 @@ openai_base_url = "https://old.invalid"
                     &paths.codex_catalog
                 };
                 let menu = catalog::read_model_menu_catalog(path).unwrap();
+                if target == "codex-desktop" {
+                    let raw = fs::read_to_string(&paths.codex_config).unwrap();
+                    let config = raw.parse::<DocumentMut>().unwrap();
+                    assert_eq!(
+                        config["model_catalog_json"].as_str(),
+                        Some(
+                            paths
+                                .codex_catalog
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                                .as_str()
+                        )
+                    );
+                }
                 assert_eq!(
                     catalog::visible_slugs(&menu).len(),
                     usize::from(hidden.is_empty())

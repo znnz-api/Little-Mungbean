@@ -1,6 +1,6 @@
 # Windows build.
 param(
-    [string]$Version = 'v1.1',
+    [string]$Version = 'v1.2',
     [string]$OutputPath = (Join-Path $PSScriptRoot "..\release\windows\Little-Mungbean-$Version.exe")
 )
 

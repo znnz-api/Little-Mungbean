@@ -26,6 +26,6 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --all-targets
       - name: Renderer injection tests
-        run: node --test tests/renderer-inject.test.js tests/model_menu_smoke.cjs
+        run: node --test tests/renderer-inject.test.js tests/native-model-catalog.cjs tests/model_menu_smoke.cjs
       - name: Release build
         run: cargo build --locked --release

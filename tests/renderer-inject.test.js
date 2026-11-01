@@ -8,11 +8,12 @@ const vm = require("node:vm");
 async function main() {
   const listeners = new Map();
   const context = vm.createContext({
-    console,
+    console: { ...console, warn() {} },
     location: { href: "app://-/index.html" },
     fetch: async () => { throw new Error("fetch must not be used when inline catalog exists"); },
     setTimeout: (callback) => { callback(); return 1; },
     clearTimeout: () => {},
+    electronBridge: { sendMessageFromView: async () => {} },
     setInterval: () => 1,
   });
   context.window = context;
@@ -22,6 +23,7 @@ async function main() {
     listeners.set(type, values);
   };
   context.dispatchEvent = () => true;
+  context.removeEventListener = () => {};
   context.__LITTLE_MUNGBEAN_CLIENT_CONFIG__ = {
     version: "test",
     defaultModel: "gpt-5.6-sol",
@@ -49,69 +51,6 @@ async function main() {
   await Promise.resolve();
 
   const api = context.__LITTLE_MUNGBEAN_MODEL_UNLOCK__;
-  assert.equal(api.health().modelCount, 2);
-  assert.equal(api.health().catalogSource, "inline");
-  assert.equal(api.health().requestClientReady, false);
-  assert.deepEqual(
-    Array.from(api._test.reasoningEfforts({
-      supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }],
-    }, "openai/gpt-6-astra"), (item) => item.reasoningEffort),
-    ["low", "medium", "high", "xhigh", "max", "ultra"],
-  );
-  assert.equal(api._test.patchRequestClient({ sendRequest: async () => ({}) }), true);
-  assert.equal(api.health().requestClientReady, true);
-  assert.equal(api.health().patchedClientCount, 1);
-
-  const recentTasks = ["task-one", "task-two"];
-  const taskPayload = { recent: recentTasks, data: ["task-three"] };
-  const taskSnapshot = JSON.stringify(taskPayload);
-  assert.equal(api._test.patchModelListResult(taskPayload), false);
-  assert.equal(JSON.stringify(taskPayload), taskSnapshot, "arbitrary task/string arrays must remain untouched");
-
-  const descriptorPayload = { data: [{ id: "task-id", name: "Task title" }] };
-  const descriptorSnapshot = JSON.stringify(descriptorPayload);
-  assert.equal(api._test.patchModelListResult(descriptorPayload), false);
-  assert.equal(JSON.stringify(descriptorPayload), descriptorSnapshot, "non-model descriptor arrays must remain untouched");
-
-  const modelResult = {
-    data: [{
-      model: "gpt-5.6-sol",
-      displayName: "5.6 Sol",
-      description: "Official description",
-      supportedReasoningEfforts: [{ reasoningEffort: "high", description: "High" }],
-      requiredArray: ["kept"],
-    }],
-  };
-  assert.equal(api._test.patchModelListResult(modelResult), true);
-  assert.equal(modelResult.data.length, 2);
-  assert.equal(modelResult.data[0].displayName, "gpt-5.6-sol");
-  assert.equal(modelResult.data[0].description, "From https://api.znnz.net");
-  assert.deepEqual(Array.from(modelResult.data[0].requiredArray), ["kept"]);
-  assert.ok(Array.isArray(modelResult.data[0].supportedReasoningEfforts));
-  assert.ok(modelResult.data[0].supportedReasoningEfforts.length > 0);
-  assert.equal(modelResult.data[1].model, "gpt-5.6-sol-max");
-  assert.equal(modelResult.data[1].displayName, "gpt-5.6-sol-max");
-  assert.deepEqual(Array.from(modelResult.data[1].requiredArray), ["kept"], "new descriptors clone required template fields");
-
-  const untracked = { type: "mcp-response", message: { id: 7, result: { data: [{ model: "gpt-5.6-sol" }] } } };
-  const untrackedSnapshot = JSON.stringify(untracked);
-  assert.equal(api._test.patchMcpData(untracked), false);
-  assert.equal(JSON.stringify(untracked), untrackedSnapshot, "untracked MCP responses must not be patched");
-
-  api._test.trackMcpRequestId(7);
-  assert.equal(api._test.patchMcpData(untracked), true);
-  assert.equal(untracked.message.result.data.length, 2);
-
-  const unrelatedConfig = { value: { available_models: ["official"] } };
-  const unrelatedSnapshot = JSON.stringify(unrelatedConfig);
-  api._test.patchStatsigModelConfig("another-config", unrelatedConfig);
-  assert.equal(JSON.stringify(unrelatedConfig), unrelatedSnapshot, "unrelated Statsig configs must remain untouched");
-
-  const modelConfig = { value: { available_models: ["official"], default_model: "official" } };
-  api._test.patchStatsigModelConfig("107580212", modelConfig);
-  assert.deepEqual(Array.from(modelConfig.value.available_models), ["official", "gpt-5.6-sol", "gpt-5.6-sol-max"]);
-  assert.equal(modelConfig.value.default_model, "gpt-5.6-sol");
-
   assert.equal(api._test.modelNameForLabel("5.6 Sol"), "gpt-5.6-sol");
   assert.equal(api._test.modelNameForLabel("5.6 Sol Max"), "gpt-5.6-sol-max");
   assert.equal(api._test.modelNameForLabel("unknown model"), null);
@@ -193,16 +132,7 @@ async function main() {
   assert.equal(solRow.textLeaf.textContent, "5.6 Sol", "ordinary clicks must not scan or patch the picker");
   assert.equal(ordinaryChatText.textContent, "5.6 Sol", "ordinary chat/task text must remain untouched");
 
-  assert.equal(script.includes("Response.prototype.json"), false);
-  assert.equal(script.includes("MutationObserver"), false);
-  assert.equal(script.includes("patchReact"), false);
-  assert.equal(script.includes("patchGraph"), false);
-  assert.equal(script.includes("patchNameArray"), false);
 
-  console.log("renderer injection regression tests passed");
+  console.log("renderer labels regression tests passed");
 }
-
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+main().catch(error => { console.error(error); process.exitCode = 1; });

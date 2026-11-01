@@ -23,7 +23,7 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-env-changed=LITTLE_MUNGBEAN_WINDOWS_VERSION");
         let version =
-            std::env::var("LITTLE_MUNGBEAN_WINDOWS_VERSION").unwrap_or_else(|_| "v1.1".to_owned());
+            std::env::var("LITTLE_MUNGBEAN_WINDOWS_VERSION").unwrap_or_else(|_| "v1.2".to_owned());
         let numeric = version
             .strip_prefix("Beta-v")
             .or_else(|| version.strip_prefix('v'))

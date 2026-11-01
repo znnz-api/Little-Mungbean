@@ -1,10 +1,7 @@
 /target/
 /release/
-/cloudflare/
-/assets/gui/-bak/
-/imgs/*/jpg/
 /docs/
-/tests/legacy/
+/imgs-bak/
 /*.log
 /*.tmp
 /.idea/

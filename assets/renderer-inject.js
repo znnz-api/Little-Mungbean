@@ -3,7 +3,7 @@
 
   const incoming = globalThis.__LITTLE_MUNGBEAN_CLIENT_CONFIG__ || {};
   const existingUnlock = globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__;
-  if (existingUnlock && existingUnlock.version === incoming.version) {
+  if (existingUnlock && existingUnlock.version === incoming.version && existingUnlock.strategy === "native-catalog-v1") {
     existingUnlock.configure(incoming);
     return;
   }
@@ -18,15 +18,12 @@
     loading: null,
     catalogSource: "none",
     failures: [],
-    patchedClients: new WeakSet(),
-    patchedStatsigClients: new WeakSet(),
-    mcpRequestIds: new Set(),
-    patchedClientCount: 0,
-    patchedStatsigClientCount: 0,
-    patchedModelResponses: 0,
+    verifiedModels: [],
+    verificationPending: null,
+    verificationError: null,
     patchedLabelCount: 0,
     messageHookInstalled: false,
-      pickerInteractionHookInstalled: false,
+    pickerInteractionHookInstalled: false,
   };
 
   const logFailure = (where, error) => {
@@ -217,385 +214,177 @@
     window.addEventListener("keydown", handleKeydown, true);
   };
 
-
-  const isExpandedReasoningModel = (name) => {
-    const slug = String(name || "").split("/").pop().toLowerCase();
-    return /^(gpt-5|gpt-6|claude-|anthropic-)/.test(slug);
-  };
-
-  const reasoningEfforts = (model, name) => {
-    const raw = model.supported_reasoning_levels
-      || model.supportedReasoningLevels
-      || model.supported_reasoning_efforts
-      || model.supportedReasoningEfforts;
-    let values;
-    if (Array.isArray(raw) && raw.length) {
-      values = raw.map((item) => {
-        const effort = typeof item === "string"
-          ? item
-          : item.reasoning_effort || item.reasoningEffort || item.effort || "medium";
-        return {
-          reasoningEffort: effort,
-          description: typeof item === "object" && item?.description
-            ? item.description
-            : `${effort} effort`,
-        };
-      });
-    } else {
-      values = ["low", "medium", "high"].map((reasoningEffort) => ({
-        reasoningEffort,
-        description: `${reasoningEffort} effort`,
-      }));
-    }
-    if (!isExpandedReasoningModel(name)) return values;
-    const byEffort = new Map(values.map((item) => [item.reasoningEffort.toLowerCase(), item]));
-    return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) =>
-      byEffort.get(reasoningEffort) || {
-        reasoningEffort,
-        description: `${reasoningEffort} effort`,
-      });
-  };
-
-  const descriptor = (name, template = null) => {
-    const model = modelMetadata(name);
-    const defaultEffort = model.default_reasoning_level || model.defaultReasoningLevel || "medium";
-    const description = state.config.modelDescription || model.description || "From gateway";
-    const efforts = reasoningEfforts(model, name);
-    return {
-      ...(template && typeof template === "object" ? template : {}),
-      model: name,
-      id: name,
-      slug: name,
-      name,
-      displayName: name,
-      display_name: name,
-      description,
-      hidden: false,
-      isDefault: name === state.config.defaultModel,
-      defaultReasoningEffort: defaultEffort,
-      // Keep all spellings used by current and older Codex Desktop builds.
-      // Some builds read the camelCase field, while newer builds read the
-      // snake_case capability field and otherwise fall back to three levels.
-      supportedReasoningLevels: efforts.map((item) => ({ ...item })),
-      supportedReasoningEfforts: efforts.map((item) => ({ ...item })),
-      supported_reasoning_levels: efforts.map((item) => ({ ...item })),
-      supported_reasoning_efforts: efforts.map((item) => ({ ...item })),
-      visibility: "list",
-      supportedInApi: true,
-      supported_in_api: true,
-    };
-  };
-
-  const isModelDescriptorArray = (value, allowEmpty = false) => Array.isArray(value)
-    && (allowEmpty || value.length > 0)
-    && value.every((item) => item && typeof item === "object" && typeof item.model === "string");
-
-  const patchModelDescriptorArray = (models, allowEmpty = false) => {
-    if (!isModelDescriptorArray(models, allowEmpty) || !state.loadedAt) return false;
-    let changed = false;
-    for (let index = models.length - 1; index >= 0; index -= 1) {
-      if (state.hiddenNames.has(models[index].model)) {
-        models.splice(index, 1);
-        changed = true;
-      }
-    }
-    const template = models.find((item) => item && typeof item.model === "string") || null;
-    const existing = new Map(models.map((item) => [item.model, item]));
-
-    for (const [name, item] of existing) {
-      if (!state.metadata.has(name)) continue;
-      const next = descriptor(name, item);
-      for (const [key, value] of Object.entries(next)) {
-        if (item[key] !== value) {
-          item[key] = value;
-          changed = true;
-        }
-      }
-    }
-
-    for (const name of state.names) {
-      if (!existing.has(name)) {
-        models.push(descriptor(name, template));
-        changed = true;
-      }
-    }
-    return changed;
-  };
-
-  const patchAvailabilityFields = (value) => {
-    if (!value || typeof value !== "object") return false;
-    let changed = false;
-    for (const key of ["availableModels", "available_models"]) {
-      const current = value[key];
-      if (current instanceof Set) {
-        for (const name of state.hiddenNames) if (current.delete(name)) changed = true;
-        for (const name of state.names) {
-          if (!current.has(name)) {
-            current.add(name);
-            changed = true;
-          }
-        }
-      } else if (Array.isArray(current) && current.every((item) => typeof item === "string")) {
-        for (let index = current.length - 1; index >= 0; index -= 1) {
-          if (state.hiddenNames.has(current[index])) {
-            current.splice(index, 1);
-            changed = true;
-          }
-        }
-        for (const name of state.names) {
-          if (!current.includes(name)) {
-            current.push(name);
-            changed = true;
-          }
-        }
-      }
-    }
-    for (const key of ["hiddenModels", "hidden_models"]) {
-      if (!Array.isArray(value[key]) || !value[key].every((item) => typeof item === "string")) continue;
-      const next = unique([...value[key].filter((name) => !state.names.includes(name)), ...state.hiddenNames]);
-      if (next.length !== value[key].length || next.some((name, index) => name !== value[key][index])) {
-        value[key] = next;
-        changed = true;
-      }
-    }
-    return changed;
-  };
-
-  const modelArrayCandidates = (result) => {
-    const candidates = [];
-    const seen = new Set();
-    const add = (value, allowEmpty = false) => {
-      if (!Array.isArray(value) || seen.has(value)) return;
-      seen.add(value);
-      candidates.push([value, allowEmpty]);
-    };
-
-    add(result, true);
-    if (!result || typeof result !== "object") return candidates;
-    add(result.models, true);
-    add(result.data, true);
-    add(result.result, true);
-    add(result.result?.models, true);
-    add(result.result?.data, true);
-    add(result.message?.result?.models, true);
-    add(result.message?.result?.data, true);
-    add(result.pages?.[0]?.data, true);
-    add(result.result?.pages?.[0]?.data, true);
-    return candidates;
-  };
-
-  const explicitContainers = (result) => {
-    if (!result || typeof result !== "object") return [];
-    return [
-      result,
-      result.result,
-      result.message,
-      result.message?.result,
-      result.data,
-      result.result?.data,
-    ].filter((value, index, list) => value && typeof value === "object" && list.indexOf(value) === index);
-  };
-
-  const patchModelListResult = (result) => {
-    if (!result || typeof result !== "object" || !state.loadedAt) return false;
-    let changed = false;
-    let foundModelArray = false;
-    for (const [models, allowEmpty] of modelArrayCandidates(result)) {
-      if (!isModelDescriptorArray(models, allowEmpty)) continue;
-      foundModelArray = true;
-      if (patchModelDescriptorArray(models, allowEmpty)) changed = true;
-    }
-    for (const container of explicitContainers(result)) {
-      if (patchAvailabilityFields(container)) changed = true;
-    }
-    if (foundModelArray) state.patchedModelResponses += 1;
-    return changed;
-  };
-
-  const MODEL_CONFIG_NAME = "107580212";
-
-  const patchStatsigModelConfig = (name, config) => {
-    if (String(name) !== MODEL_CONFIG_NAME || !config?.value || typeof config.value !== "object") return config;
-    const value = config.value;
-    const available = Array.isArray(value.available_models)
-      && value.available_models.every((item) => typeof item === "string")
-      ? value.available_models.filter((name) => !state.hiddenNames.has(name))
-      : [];
-    for (const modelName of state.names) if (!available.includes(modelName)) available.push(modelName);
-    const nextValue = {
-      ...value,
-      available_models: available,
-      default_model: state.config.defaultModel || value.default_model || state.names[0],
-    };
-    try {
-      config.value = nextValue;
-      return config;
-    } catch {
-      return { ...config, value: nextValue };
-    }
-  };
-
-  const statsigClients = () => {
-    const root = globalThis.__STATSIG__;
-    if (!root || typeof root !== "object") return [];
-    const clients = [root.firstInstance];
-    try { if (typeof root.instance === "function") clients.push(root.instance()); } catch {}
-    if (root.instances && typeof root.instances === "object") clients.push(...Object.values(root.instances));
-    return clients.filter((client, index, list) => client && typeof client === "object" && list.indexOf(client) === index);
-  };
-
-  const patchStatsig = () => {
-    for (const client of statsigClients()) {
-      if (state.patchedStatsigClients.has(client) || typeof client.getDynamicConfig !== "function") continue;
-      const original = client.getDynamicConfig.bind(client);
-      client.getDynamicConfig = (name, options) => patchStatsigModelConfig(name, original(name, options));
-      state.patchedStatsigClients.add(client);
-      state.patchedStatsigClientCount += 1;
-      try { patchStatsigModelConfig(MODEL_CONFIG_NAME, client.getDynamicConfig(MODEL_CONFIG_NAME, { disableExposureLog: true })); } catch {}
-    }
-  };
-
-  const patchMcpData = (data) => {
-    if (!data || typeof data !== "object" || data.type !== "mcp-response") return false;
-    const message = data.message || data.response;
-    const id = message?.id == null ? "" : String(message.id);
-    if (!id || !state.mcpRequestIds.has(id)) return false;
-    state.mcpRequestIds.delete(id);
-    return patchModelListResult(message?.result || message);
-  };
-
-  const installMessagePatch = () => {
-    if (window.__LITTLE_MUNGBEAN_MESSAGE_PATCHED__) {
-      state.messageHookInstalled = true;
+  // The CLI reads model_catalog_json before startup. Observe only our own
+  // read-only model/list requests; never rewrite application RPCs or feature flags.
+  const readModelPage = (cursor) => new Promise((resolve, reject) => {
+    const bridge = window.electronBridge;
+    if (typeof bridge?.sendMessageFromView !== "function") {
+      reject(new Error("Codex Desktop model bridge is unavailable"));
       return;
     }
-    window.__LITTLE_MUNGBEAN_MESSAGE_PATCHED__ = true;
-    state.messageHookInstalled = true;
-    const originalDispatch = window.dispatchEvent;
-    window.dispatchEvent = function (event) {
-      try {
-        const detail = event?.detail;
-        const request = detail?.request;
-        if (event?.type === "codex-message-from-view" && detail?.type === "mcp-request" && request?.method === "model/list") {
-          request.params = { ...(request.params || {}), includeHidden: true };
-          if (request.id != null) state.mcpRequestIds.add(String(request.id));
-        }
-        if (event?.type === "message") patchMcpData(event.data);
-      } catch (error) { logFailure("dispatchEvent", error); }
-      return originalDispatch.call(this, event);
+    const id = `little-mungbean-model-check-${Date.now()}-${Math.random()}`;
+    const transfers = new Map();
+    let settled = false;
+    let timer;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      window.removeEventListener("message", receive, true);
+      transfers.clear();
+      if (error) reject(error);
+      else resolve(value);
     };
-    window.addEventListener("message", (event) => {
-      try { patchMcpData(event.data); } catch (error) { logFailure("message", error); }
-    }, true);
-  };
-
-  const actualRequestMethod = (method, params) => method === "send-cli-request-for-host"
-    ? String(params?.method || "")
-    : String(method || "");
-
-  const includeHiddenParams = (method, params) => {
-    const actual = actualRequestMethod(method, params);
-    if (actual !== "model/list") return params;
-    if (method === "send-cli-request-for-host") {
-      return {
-        ...(params || {}),
-        params: { ...(params?.params || {}), includeHidden: true },
+    const consume = (transfer, tokens) => {
+      const save = (value) => {
+        const parent = transfer.stack.at(-1);
+        if (!parent) transfer.root = value;
+        else if (Array.isArray(parent.value)) parent.value.push(value);
+        else {
+          if (parent.key == null) throw new Error("Invalid model response object");
+          Object.defineProperty(parent.value, parent.key, { value, enumerable: true, writable: true, configurable: true });
+          parent.key = null;
+        }
       };
-    }
-    return { ...(params || {}), includeHidden: true };
-  };
-
-  const patchRequestClient = (client) => {
-    if (!client || typeof client.sendRequest !== "function" || state.patchedClients.has(client)) return false;
-    const original = client.sendRequest.bind(client);
-    client.sendRequest = async function (method, params, options) {
-      const nextParams = includeHiddenParams(method, params);
-      const result = await original(method, nextParams, options);
-      const actual = actualRequestMethod(method, nextParams);
-      if (actual === "list-models-for-host" || actual === "model/list") patchModelListResult(result);
-      return result;
-    };
-    state.patchedClients.add(client);
-    state.patchedClientCount += 1;
-    return true;
-  };
-
-  const scanWebpackClients = () => {
-    for (const key of Object.keys(globalThis)) {
-      if (!key.startsWith("webpackChunk") || !Array.isArray(globalThis[key])) continue;
-      try {
-        let runtime;
-        const chunk = globalThis[key];
-        const marker = `little_mungbean_${Date.now()}_${Math.random()}`;
-        chunk.push([[marker], {}, (require) => { runtime = require; }]);
-        chunk.pop();
-        const cache = runtime?.c;
-        if (!cache || typeof cache !== "object") continue;
-        for (const module of Object.values(cache)) {
-          const exports = module?.exports;
-          if (!exports) continue;
-          patchRequestClient(exports);
-          if (typeof exports === "object") {
-            for (const candidate of Object.values(exports).slice(0, 80)) {
-              patchRequestClient(candidate);
-              try { if (candidate && typeof candidate.get === "function") patchRequestClient(candidate.get()); } catch {}
-            }
+      for (const token of tokens) {
+        switch (token.type) {
+          case "object-start":
+          case "array-start": {
+            const value = token.type === "array-start" ? [] : {};
+            save(value);
+            transfer.stack.push({ value, key: null });
+            break;
           }
+          case "container-end":
+            if (!transfer.stack.pop()) throw new Error("Invalid model response container");
+            break;
+          case "key": transfer.stack.at(-1).key = token.value; break;
+          case "value": save(token.value); break;
+          case "string-start": transfer.string = []; transfer.target = token.target; break;
+          case "string-chunk": transfer.string.push(token.value); break;
+          case "string-end": {
+            const value = transfer.string.join("");
+            if (transfer.target === "key") transfer.stack.at(-1).key = value;
+            else save(value);
+            transfer.string = null;
+            break;
+          }
+          default: throw new Error("Unsupported model response token");
         }
-      } catch (error) { logFailure("webpack", error); }
-    }
+      }
+    };
+    const receive = (event) => {
+      if (event.source != null && event.source !== window) return;
+      let data = event.data;
+      try {
+        if (data?.marker === "codex-host-chunked-message-v1") {
+          if (data.kind === "start") {
+            transfers.set(data.transferId, { sequence: data.sequence + 1, stack: [], root: null, string: null, size: 0 });
+            return;
+          }
+          const transfer = transfers.get(data.transferId);
+          if (!transfer) return;
+          if (transfer.sequence++ !== data.sequence) {
+            transfers.delete(data.transferId);
+            return;
+          }
+          if (data.kind === "chunk") {
+            transfer.size += JSON.stringify(data.tokens).length;
+            if (transfer.size > 32 * 1024 * 1024) {
+              transfers.delete(data.transferId);
+              return;
+            }
+            consume(transfer, data.tokens);
+            return;
+          }
+          if (data.kind !== "end") return;
+          transfers.delete(data.transferId);
+          if (transfer.stack.length || transfer.string) return;
+          data = transfer.root;
+        }
+        if (data?.type !== "mcp-response") return;
+        const message = data.message || data.response;
+        if (String(message?.id) !== id) return;
+        if (event.data?.type === "mcp-response") event.stopImmediatePropagation?.();
+        if (message.error) finish(new Error(message.error.message || "Model list request failed"));
+        else if (!Array.isArray(message.result?.data)) finish(new Error("Invalid Codex model list"));
+        else finish(null, message.result);
+      } catch (error) {
+        // Malformed unrelated host messages must never interrupt the application.
+        transfers.clear();
+      }
+    };
+    window.addEventListener("message", receive, true);
+    timer = setTimeout(() => finish(new Error("Codex model list verification timed out")), 8000);
+    try {
+      Promise.resolve(bridge.sendMessageFromView({
+        type: "mcp-request", hostId: "local",
+        request: { id, method: "model/list", params: { cursor, limit: 100, includeHidden: false } },
+      })).catch((error) => finish(error));
+    } catch (error) { finish(error); }
+  });
+
+  const verifyModelList = () => {
+    if (state.verificationPending) return state.verificationPending;
+    state.verificationPending = (async () => {
+      const names = [];
+      const cursors = new Set();
+      let cursor = null;
+      do {
+        const result = await readModelPage(cursor);
+        for (const model of result.data) if (!model.hidden) names.push(model.model);
+        cursor = result.nextCursor ?? null;
+        if (cursor != null && cursors.has(cursor)) throw new Error("Model catalog pagination repeated a cursor");
+        cursors.add(cursor);
+        if (cursors.size > 100) throw new Error("Model catalog has too many pages");
+      } while (cursor != null);
+      const expected = new Set(state.names);
+      if (names.length !== expected.size || new Set(names).size !== expected.size || names.some((name) => !expected.has(name))) {
+        throw new Error(`Codex model list does not match the gateway catalog (${names.length}/${expected.size})`);
+      }
+      state.verifiedModels = names;
+      state.verificationError = null;
+      state.verified = true;
+      return true;
+    })().catch((error) => {
+      state.verified = false;
+      state.verificationError = String(error?.message || error);
+      logFailure("native-model-list", error);
+      return false;
+    }).finally(() => { state.verificationPending = null; });
+    return state.verificationPending;
   };
 
   const refreshPass = () => {
-    if (!state.loadedAt) return;
-    try { patchStatsig(); } catch (error) { logFailure("statsig", error); }
-    try { scanWebpackClients(); } catch (error) { logFailure("request-client", error); }
     try { patchModelPickerLabels(); } catch (error) { logFailure("model-labels", error); }
   };
-
   const configure = (config) => {
     state.config = { ...state.config, ...(config || {}) };
+    state.verified = false;
     loadCatalog(true).then(() => {
-      for (let i = 0; i < 30; i += 1) setTimeout(refreshPass, i * 150);
+      refreshPass();
+      return verifyModelList();
     }).catch((error) => logFailure("catalog", error));
   };
 
   globalThis.__LITTLE_MUNGBEAN_MODEL_UNLOCK__ = {
     version: incoming.version || "unknown",
+    strategy: "native-catalog-v1",
     configure,
-    refresh: () => loadCatalog(true).then(refreshPass),
+    refresh: () => loadCatalog(true).then(verifyModelList),
     health: () => ({
       installed: true,
-      catalogReady: state.loadedAt > 0
-        && (state.names.length > 0 || Boolean(state.config.allowEmptyModelList)),
+      catalogReady: state.loadedAt > 0 && (state.names.length > 0 || Boolean(state.config.allowEmptyModelList)),
+      modelListVerified: state.verified === true,
       modelCount: state.names.length,
-      loadedAt: state.loadedAt,
+      verifiedModelCount: state.verifiedModels.length,
       catalogSource: state.catalogSource,
-      messageHookInstalled: state.messageHookInstalled,
       pickerInteractionHookInstalled: state.pickerInteractionHookInstalled,
-      patchedClientCount: state.patchedClientCount,
-      requestClientReady: state.patchedClientCount > 0,
-      patchedStatsigClientCount: state.patchedStatsigClientCount,
-      patchedModelResponses: state.patchedModelResponses,
-      patchedLabelCount: state.patchedLabelCount,
+      verificationError: state.verificationError,
       failures: state.failures.slice(-5),
-      href: location.href,
     }),
-    _test: {
-      patchModelListResult,
-      patchMcpData,
-      patchRequestClient,
-      trackMcpRequestId: (id) => state.mcpRequestIds.add(String(id)),
-      patchStatsigModelConfig,
-      reasoningEfforts,
-      modelNameForLabel,
-      patchModelPickerLabels,
-      isModelPickerInteraction,
-      schedulePickerLabelRefresh,
-    },
+    _test: { modelNameForLabel, patchModelPickerLabels, isModelPickerInteraction, schedulePickerLabelRefresh, readModelPage },
   };
-
-  installMessagePatch();
   installPickerInteractionPatch();
   configure(incoming);
   setInterval(refreshPass, 2000);

@@ -8665,6 +8665,13 @@ unsafe fn apply_cutout_region(hwnd: HWND, width: i32, height: i32, dpi: u32) {
         unsafe { subtract_region_rect(full, cut, width - corner, height - corner, width, height) };
     }
 
+    let top_width = scale_dip(layout::WINDOW_TOP_CUT_WIDTH, dpi).clamp(0, width);
+    let top_height = scale_dip(layout::WINDOW_TOP_CUT_HEIGHT, dpi).clamp(0, height);
+    if top_width > 0 && top_height > 0 {
+        unsafe { subtract_region_rect(full, cut, 0, 0, top_width, top_height) };
+        unsafe { subtract_region_rect(full, cut, width - top_width, 0, width, top_height) };
+    }
+
     let side_width = scale_dip(layout::WINDOW_SIDE_CUT_WIDTH, dpi).clamp(0, width);
     let side_height = scale_dip(layout::WINDOW_SIDE_CUT_HEIGHT, dpi).clamp(0, height);
     if side_width > 0 && side_height > 0 {

@@ -9,8 +9,8 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, FILETIME, GetLastError, HANDLE, HWND,
-    LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, FILETIME, GetLastError, HANDLE, HLOCAL,
+    HWND, LPARAM, LocalFree, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Security::WinTrust::{
@@ -34,8 +34,9 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
-    ACTIVATEOPTIONS, ApplicationActivationManager, IApplicationActivationManager,
-    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
+    ACTIVATEOPTIONS, ApplicationActivationManager, CommandLineToArgvW,
+    IApplicationActivationManager, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetWindowThreadProcessId, HWND_BROADCAST, IsWindowVisible,
@@ -352,6 +353,69 @@ pub fn running_client_processes() -> Result<Vec<(crate::gui_worker::ClientTarget
     Ok(result)
 }
 
+fn windows_command_arguments(command: &str) -> Vec<String> {
+    if command.trim().is_empty() {
+        return Vec::new();
+    }
+    let wide = command.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut count = 0;
+    let argv = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
+    if argv.is_null() {
+        return Vec::new();
+    }
+    let arguments = if count > 0 {
+        unsafe { std::slice::from_raw_parts(argv, count as usize) }
+            .iter()
+            .map(|argument| unsafe { argument.to_string() }.unwrap_or_default())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let _ = unsafe { LocalFree(Some(HLOCAL(argv.cast()))) };
+    arguments
+}
+
+fn codex_runs_terminal_session(arguments: &[String]) -> bool {
+    let mut arguments = arguments.iter().map(String::as_str);
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            return true;
+        }
+        // Only the first positional argument is a subcommand. Configuration
+        // values, working directories and prompts may contain service names.
+        if matches!(
+            argument,
+            "-c" | "--config"
+                | "-m"
+                | "--model"
+                | "-p"
+                | "--profile"
+                | "-s"
+                | "--sandbox"
+                | "-a"
+                | "--ask-for-approval"
+                | "-C"
+                | "--cd"
+                | "-i"
+                | "--image"
+                | "--add-dir"
+                | "--enable"
+                | "--disable"
+                | "--remote"
+                | "--remote-auth-token-env"
+                | "--local-provider"
+        ) {
+            arguments.next();
+        } else if !argument.starts_with('-') {
+            return !matches!(
+                argument,
+                "app-server" | "sandbox" | "exec-server" | "mcp-server" | "completion" | "debug"
+            );
+        }
+    }
+    true
+}
+
 fn classify_client_process(
     name: &str,
     path: &str,
@@ -363,18 +427,38 @@ fn classify_client_process(
     } else if is_official_claude_desktop_path(path) {
         Some(ClientTarget::ClaudeDesktop)
     } else {
-        let command = command.replace('\\', "/").to_ascii_lowercase();
-        // Desktop helpers and IDE app-server processes are not terminal sessions.
-        if path.to_ascii_lowercase().contains("\\windowsapps\\")
-            || command.contains("app-server")
-            || command.contains("--type=")
+        let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+        if normalized_path.contains("/windowsapps/") {
+            return None;
+        }
+        let arguments = windows_command_arguments(command);
+        if arguments
+            .iter()
+            .any(|argument| argument.starts_with("--type="))
         {
+            return None;
+        }
+        let codex_arguments = if name == "codex" {
+            arguments.get(1..)
+        } else if name == "node"
+            && arguments.get(1).is_some_and(|script| {
+                let script = script.replace('\\', "/").to_ascii_lowercase();
+                script.ends_with("/@openai/codex/bin/codex.js")
+            })
+        {
+            arguments.get(2..)
+        } else {
             None
-        } else if name == "codex" || (name == "node" && command.contains("@openai/codex/")) {
-            Some(ClientTarget::CodexCli)
-        } else if name == "claude"
-            || (name == "node" && command.contains("@anthropic-ai/claude-code/"))
-        {
+        };
+        if let Some(codex_arguments) = codex_arguments {
+            // Desktop tool execution uses the same codex.exe as the CLI.
+            // Its sandbox/services and detached CLI daemon are not sessions.
+            return (!normalized_path.contains("/app-server-daemon/")
+                && codex_runs_terminal_session(codex_arguments))
+            .then_some(ClientTarget::CodexCli);
+        }
+        let command = command.replace('\\', "/").to_ascii_lowercase();
+        if name == "claude" || (name == "node" && command.contains("@anthropic-ai/claude-code/")) {
             Some(ClientTarget::ClaudeCode)
         } else {
             None
@@ -2285,6 +2369,72 @@ mod tests {
         assert_eq!(
             classify_client_process("node", r"C:\node\node.exe", "node.exe unrelated.js"),
             None
+        );
+    }
+
+    #[test]
+    fn codex_background_services_do_not_count_as_terminal_sessions() {
+        let path = r"C:\Users\test\AppData\Local\OpenAI\Codex\bin\version\codex.exe";
+        for command in [
+            r#"codex.exe sandbox -c default_permissions="node_repl" -- node.exe kernel.js"#,
+            r#"codex.exe -c "features.code_mode_host=true" app-server --analytics-default-enabled"#,
+            "codex.exe --config=features.code_mode_host=true sandbox -- cmd.exe /c echo test",
+            "codex.exe exec-server",
+            "codex.exe mcp-server",
+            "codex.exe debug models --bundled",
+        ] {
+            assert_eq!(
+                classify_client_process("codex", path, command),
+                None,
+                "{command}"
+            );
+        }
+        assert_eq!(classify_client_process("codex", path, ""), None);
+        assert_eq!(
+            classify_client_process(
+                "codex",
+                r"C:\Users\test\.codex\app-server-daemon\version\codex.exe",
+                "codex.exe"
+            ),
+            None
+        );
+        for command in [
+            r#"node.exe "C:\npm\node_modules\@openai\codex\bin\codex.js" sandbox -- node.exe kernel.js"#,
+            r#"node.exe unrelated.js "C:\npm\node_modules\@openai\codex\bin\codex.js""#,
+        ] {
+            assert_eq!(
+                classify_client_process("node", r"C:\node\node.exe", command),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn codex_terminal_sessions_allow_service_names_in_options_and_prompts() {
+        use crate::gui_worker::ClientTarget::CodexCli;
+        for command in [
+            "codex.exe",
+            "codex.exe resume --last",
+            "codex.exe fork --last",
+            r#""C:\Program Files\Codex\codex.exe" -C "C:\my app-server" --no-alt-screen"#,
+            r#"codex.exe -c "model=\"app-server\"" resume --last"#,
+            r#"codex.exe --sandbox workspace-write -- "sandbox""#,
+            r#"codex.exe exec "Explain app-server and sandbox --type=renderer""#,
+            r#"codex.exe "Explain app-server and sandbox""#,
+        ] {
+            assert_eq!(
+                classify_client_process("codex", r"C:\tools\codex.exe", command),
+                Some(CodexCli),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            classify_client_process(
+                "node",
+                r"C:\node\node.exe",
+                r#"node.exe "C:\npm\node_modules\@openai\codex\bin\codex.js" resume --last"#
+            ),
+            Some(CodexCli)
         );
     }
 

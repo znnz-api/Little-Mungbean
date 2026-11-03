@@ -30,6 +30,11 @@ pub const WINDOW_WIDTH: f32 = 380.0;
 
 // 主窗口四角直角切口边长，按 96 DPI 下的逻辑像素定义；设为 0 可关闭。
 pub const WINDOW_CORNER_CUT_SIZE: f32 = 5.0;
+// 顶部左右阶梯切口，贴齐窗口两侧；尺寸按 96 DPI 下的逻辑像素定义。
+#[cfg(windows)]
+pub const WINDOW_TOP_CUT_WIDTH: f32 = 10.0;
+#[cfg(windows)]
+pub const WINDOW_TOP_CUT_HEIGHT: f32 = 2.0;
 // 主窗口左右侧边小切口宽度，按 96 DPI 下的逻辑像素定义；设为 0 可关闭。
 pub const WINDOW_SIDE_CUT_WIDTH: f32 = 5.0;
 // 主窗口左右侧边小切口高度，按 96 DPI 下的逻辑像素定义；设为 0 可关闭。
